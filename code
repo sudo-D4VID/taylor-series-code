@@ -1,10 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import * as math from "mathjs";
 
-// ─── Factorial table 0..30 ────────────────────────────────────────────────────
-const FACT = [1];
-for (let i = 1; i <= 30; i++) FACT[i] = FACT[i - 1] * i;
-
 // ─── DFT-based Taylor coefficients (Cauchy integral formula) ─────────────────
 // Evaluates f on a circle of radius r in the complex plane, then uses
 // the discrete Fourier transform to extract each Taylor coefficient.
@@ -13,9 +9,10 @@ for (let i = 1; i <= 30; i++) FACT[i] = FACT[i - 1] * i;
 function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024) {
   const fRe = new Float64Array(N);
   const fIm = new Float64Array(N);
+  const TWO_PI_OVER_N = (2 * Math.PI) / N;
 
   for (let k = 0; k < N; k++) {
-    const theta = (2 * Math.PI * k) / N;
+    const theta = TWO_PI_OVER_N * k;
     const zRe = a + r * Math.cos(theta);
     const zIm = r * Math.sin(theta);
     try {
@@ -27,22 +24,27 @@ function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024) {
   }
 
   const coeffs = [];
+  let rPow = 1; // r^n computed incrementally
   for (let n = 0; n < numTerms; n++) {
     let re = 0;
+    const angleStep = -TWO_PI_OVER_N * n;
     for (let k = 0; k < N; k++) {
       if (!isFinite(fRe[k])) continue;
-      const angle = (-2 * Math.PI * n * k) / N;
+      const angle = angleStep * k;
       re += fRe[k] * Math.cos(angle) - fIm[k] * Math.sin(angle);
     }
-    coeffs.push(re / (N * Math.pow(r, n)));
+    coeffs.push(re / (N * rPow));
+    rPow *= r;
   }
   return coeffs;
 }
 
-// ─── Evaluate Taylor polynomial at x ─────────────────────────────────────────
+// ─── Evaluate Taylor polynomial at x (Horner's method) ───────────────────────
+// Evaluates Σ cₙ·(x−a)ⁿ from highest to lowest for numerical stability.
 function evalPoly(coeffs, a, x) {
-  let sum = 0, dx = x - a, pw = 1;
-  for (let i = 0; i < coeffs.length; i++) { sum += coeffs[i] * pw; pw *= dx; }
+  const dx = x - a;
+  let sum = 0;
+  for (let i = coeffs.length - 1; i >= 0; i--) sum = sum * dx + coeffs[i];
   return sum;
 }
 
@@ -61,11 +63,6 @@ function integCoeffs(coeffs) {
   const ig = [0]; // C = 0
   for (let n = 0; n < coeffs.length; n++) ig.push(coeffs[n] / (n + 1));
   return ig;
-}
-
-// ─── Second derivative Taylor coefficients ────────────────────────────────────
-function deriv2Coeffs(coeffs) {
-  return derivCoeffs(derivCoeffs(coeffs));
 }
 
 // ─── Nice round axis step size ────────────────────────────────────────────────
@@ -97,6 +94,7 @@ const THEMES = {
     errOrange: "#fb923c", lblColor: "#2e4d3c", dimCoeff: "#22303f",
     derivColor: "#f472b6", integColor: "#60a5fa", deriv2Color: "#fb923c",
     guideColor: "rgba(248,113,113,0.45)", hintColor: "rgba(255,255,255,.18)",
+    centerStroke: "#fff",
   },
   light: {
     bg: "#f5f5f5", text: "#1e293b", textDim: "#64748b", textMuted: "#94a3b8",
@@ -110,6 +108,7 @@ const THEMES = {
     errOrange: "#ea580c", lblColor: "#64748b", dimCoeff: "#cbd5e1",
     derivColor: "#db2777", integColor: "#2563eb", deriv2Color: "#ea580c",
     guideColor: "rgba(220,38,38,0.35)", hintColor: "rgba(0,0,0,.25)",
+    centerStroke: "#000",
   },
 };
 
@@ -146,12 +145,14 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
 
     ctx.lineWidth = 1;
     ctx.strokeStyle = t.gridLine;
+    ctx.beginPath();
     for (let gx = x0; gx < wx(W) + step; gx += step) {
-      ctx.beginPath(); ctx.moveTo(sx(gx), 0); ctx.lineTo(sx(gx), H); ctx.stroke();
+      ctx.moveTo(sx(gx), 0); ctx.lineTo(sx(gx), H);
     }
     for (let gy = y0; gy < wy(0) + step; gy += step) {
-      ctx.beginPath(); ctx.moveTo(0, sy(gy)); ctx.lineTo(W, sy(gy)); ctx.stroke();
+      ctx.moveTo(0, sy(gy)); ctx.lineTo(W, sy(gy));
     }
+    ctx.stroke();
 
     // Axes
     const axY = Math.max(1, Math.min(H - 1, sy(0)));
@@ -225,7 +226,7 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
     if (isFinite(cval)) {
       ctx.beginPath(); ctx.arc(sx(center), sy(cval), 6, 0, 6.283);
       ctx.fillStyle = t.accent3; ctx.fill();
-      ctx.strokeStyle = t.bg === "#07090e" ? "#fff" : "#000"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.strokeStyle = t.centerStroke; ctx.lineWidth = 1.5; ctx.stroke();
     }
 
     // evalX vertical guide
@@ -364,10 +365,10 @@ export default function TaylorApp() {
     return { coeffs: null, coeffErr: "Could not compute — try a different center point" };
   }, [compiled, center, terms]);
 
-  // Derivative / Integral / Second derivative coefficients
-  const dCoeffs  = useMemo(() => coeffs ? derivCoeffs(coeffs) : null, [coeffs]);
-  const d2Coeffs = useMemo(() => coeffs ? deriv2Coeffs(coeffs) : null, [coeffs]);
-  const iCoeffs  = useMemo(() => coeffs ? integCoeffs(coeffs) : null, [coeffs]);
+  // Derivative / Integral / Second derivative coefficients (lazy — only when toggled on)
+  const dCoeffs  = useMemo(() => (showDeriv || showDeriv2) && coeffs ? derivCoeffs(coeffs) : null, [coeffs, showDeriv, showDeriv2]);
+  const d2Coeffs = useMemo(() => showDeriv2 && dCoeffs ? derivCoeffs(dCoeffs) : null, [dCoeffs, showDeriv2]);
+  const iCoeffs  = useMemo(() => showInteg && coeffs ? integCoeffs(coeffs) : null, [coeffs, showInteg]);
 
   // Numerical results at evalX
   const { approx, exact, pctErr, derivVal, deriv2Val, integVal } = useMemo(() => {
@@ -504,7 +505,7 @@ export default function TaylorApp() {
           <div>
             <div className="lbl">Evaluate at <span style={{ color:t.accent }}>x</span> =</div>
             <input type="number" step="0.1" value={evalX}
-              onChange={e => setEvalX(parseFloat(e.target.value) ?? 0)}
+              onChange={e => setEvalX(parseFloat(e.target.value) || 0)}
               style={{ width:"100%" }} />
           </div>
 
