@@ -46,6 +46,28 @@ function evalPoly(coeffs, a, x) {
   return sum;
 }
 
+// ─── Derivative Taylor coefficients ───────────────────────────────────────────
+// If f(x) = Σ cₙ(x−a)ⁿ then f′(x) = Σ (n+1)·c_{n+1}·(x−a)ⁿ
+function derivCoeffs(coeffs) {
+  const d = [];
+  for (let n = 0; n < coeffs.length - 1; n++) d.push((n + 1) * coeffs[n + 1]);
+  return d;
+}
+
+// ─── Integral Taylor coefficients ─────────────────────────────────────────────
+// If f(x) = Σ cₙ(x−a)ⁿ then ∫f dx = C + Σ cₙ/(n+1)·(x−a)^{n+1}
+// Here C = 0 (constant of integration)
+function integCoeffs(coeffs) {
+  const ig = [0]; // C = 0
+  for (let n = 0; n < coeffs.length; n++) ig.push(coeffs[n] / (n + 1));
+  return ig;
+}
+
+// ─── Second derivative Taylor coefficients ────────────────────────────────────
+function deriv2Coeffs(coeffs) {
+  return derivCoeffs(derivCoeffs(coeffs));
+}
+
 // ─── Nice round axis step size ────────────────────────────────────────────────
 function niceStep(target) {
   const p = Math.pow(10, Math.floor(Math.log10(Math.abs(target) || 1)));
@@ -61,8 +83,38 @@ function fmt(n) {
   return +n.toPrecision(3) + "";
 }
 
+// ─── Theme definitions ────────────────────────────────────────────────────────
+const THEMES = {
+  dark: {
+    bg: "#07090e", text: "#c5cdd6", textDim: "#4a6a5a", textMuted: "#2e4d3c",
+    panel: "#0c1018", border: "#22303f", borderDim: "#1c2a38", borderPanel: "#121c28",
+    accent: "#f6c90e", accent2: "#4ecdc4", accent3: "#c084fc", red: "#f87171",
+    gridLine: "rgba(255,255,255,0.04)", axis: "rgba(255,255,255,0.2)",
+    axisLabel: "rgba(255,255,255,0.28)", legendBg: "transparent",
+    tagBg: "#0c1018", tagBorder: "#22303f", tagText: "#6a7e8e",
+    inputBg: "#0c1018", inputBorder: "#22303f", scrollThumb: "#22303f",
+    headerSub: "#1e3e2c", headerTitle: "#dce8f0", headerInfo: "#2a4438",
+    errOrange: "#fb923c", lblColor: "#2e4d3c", dimCoeff: "#22303f",
+    derivColor: "#f472b6", integColor: "#60a5fa", deriv2Color: "#fb923c",
+    guideColor: "rgba(248,113,113,0.45)", hintColor: "rgba(255,255,255,.18)",
+  },
+  light: {
+    bg: "#f5f5f5", text: "#1e293b", textDim: "#64748b", textMuted: "#94a3b8",
+    panel: "#ffffff", border: "#cbd5e1", borderDim: "#e2e8f0", borderPanel: "#e2e8f0",
+    accent: "#b45309", accent2: "#0d9488", accent3: "#7c3aed", red: "#dc2626",
+    gridLine: "rgba(0,0,0,0.06)", axis: "rgba(0,0,0,0.25)",
+    axisLabel: "rgba(0,0,0,0.4)", legendBg: "transparent",
+    tagBg: "#ffffff", tagBorder: "#cbd5e1", tagText: "#475569",
+    inputBg: "#ffffff", inputBorder: "#cbd5e1", scrollThumb: "#cbd5e1",
+    headerSub: "#64748b", headerTitle: "#0f172a", headerInfo: "#64748b",
+    errOrange: "#ea580c", lblColor: "#64748b", dimCoeff: "#cbd5e1",
+    derivColor: "#db2777", integColor: "#2563eb", deriv2Color: "#ea580c",
+    guideColor: "rgba(220,38,38,0.35)", hintColor: "rgba(0,0,0,.25)",
+  },
+};
+
 // ─── Desmos-style canvas graph ────────────────────────────────────────────────
-function Graph({ realFn, coeffs, center, evalX, numTerms }) {
+function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Coeffs, showDeriv, showInteg, showDeriv2, theme }) {
   const canvasRef = useRef(null);
   const viewRef   = useRef({ cx: 0, cy: 0, scale: 80 }); // world px/unit
   const dragRef   = useRef(null);
@@ -81,8 +133,10 @@ function Graph({ realFn, coeffs, center, evalX, numTerms }) {
     const wx = px => (px - W / 2) / S + cx;
     const wy = py => (H / 2 - py) / S + cy;
 
+    const t = theme;
+
     // Background
-    ctx.fillStyle = "#07090e";
+    ctx.fillStyle = t.bg;
     ctx.fillRect(0, 0, W, H);
 
     // Grid lines
@@ -91,7 +145,7 @@ function Graph({ realFn, coeffs, center, evalX, numTerms }) {
     const y0 = Math.floor(wy(H) / step) * step;
 
     ctx.lineWidth = 1;
-    ctx.strokeStyle = "rgba(255,255,255,0.04)";
+    ctx.strokeStyle = t.gridLine;
     for (let gx = x0; gx < wx(W) + step; gx += step) {
       ctx.beginPath(); ctx.moveTo(sx(gx), 0); ctx.lineTo(sx(gx), H); ctx.stroke();
     }
@@ -102,18 +156,18 @@ function Graph({ realFn, coeffs, center, evalX, numTerms }) {
     // Axes
     const axY = Math.max(1, Math.min(H - 1, sy(0)));
     const axX = Math.max(1, Math.min(W - 1, sx(0)));
-    ctx.strokeStyle = "rgba(255,255,255,0.2)";
+    ctx.strokeStyle = t.axis;
     ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.moveTo(0, axY); ctx.lineTo(W, axY); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(axX, 0); ctx.lineTo(axX, H); ctx.stroke();
 
     // Axis arrows
-    ctx.fillStyle = "rgba(255,255,255,0.2)";
+    ctx.fillStyle = t.axis;
     ctx.beginPath(); ctx.moveTo(W - 2, axY); ctx.lineTo(W - 11, axY - 5); ctx.lineTo(W - 11, axY + 5); ctx.fill();
     ctx.beginPath(); ctx.moveTo(axX, 2);     ctx.lineTo(axX - 5, 11);      ctx.lineTo(axX + 5, 11);      ctx.fill();
 
     // Axis labels
-    ctx.fillStyle = "rgba(255,255,255,0.28)";
+    ctx.fillStyle = t.axisLabel;
     ctx.font = "10px Consolas, 'Courier New', monospace";
     ctx.textAlign = "center";
     for (let gx = x0; gx < wx(W) + step; gx += step) {
@@ -151,21 +205,33 @@ function Graph({ realFn, coeffs, center, evalX, numTerms }) {
     };
 
     // Draw exact function (gold) and Taylor approx (teal dashed)
-    if (realFn)       plotFn(realFn, "#f6c90e", 2.5);
-    if (coeffs?.length) plotFn(x => evalPoly(coeffs, center, x), "#4ecdc4", 2, [8, 4]);
+    if (realFn)       plotFn(realFn, t.accent, 2.5);
+    if (coeffs?.length) plotFn(x => evalPoly(coeffs, center, x), t.accent2, 2, [8, 4]);
+
+    // Draw derivative curve (pink dashed)
+    if (showDeriv && dCoeffs?.length)
+      plotFn(x => evalPoly(dCoeffs, center, x), t.derivColor, 1.8, [6, 3]);
+
+    // Draw second derivative curve (orange dotted)
+    if (showDeriv2 && d2Coeffs?.length)
+      plotFn(x => evalPoly(d2Coeffs, center, x), t.deriv2Color, 1.5, [3, 3]);
+
+    // Draw integral curve (blue dash-dot)
+    if (showInteg && iCoeffs?.length)
+      plotFn(x => evalPoly(iCoeffs, center, x), t.integColor, 1.8, [8, 3, 2, 3]);
 
     // Expansion center marker (purple dot)
     const cval = realFn ? realFn(center) : 0;
     if (isFinite(cval)) {
       ctx.beginPath(); ctx.arc(sx(center), sy(cval), 6, 0, 6.283);
-      ctx.fillStyle = "#c084fc"; ctx.fill();
-      ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = t.accent3; ctx.fill();
+      ctx.strokeStyle = t.bg === "#07090e" ? "#fff" : "#000"; ctx.lineWidth = 1.5; ctx.stroke();
     }
 
     // evalX vertical guide
     if (evalX !== null && isFinite(evalX)) {
       ctx.setLineDash([4, 4]);
-      ctx.strokeStyle = "rgba(248,113,113,0.45)";
+      ctx.strokeStyle = t.guideColor;
       ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(sx(evalX), 0); ctx.lineTo(sx(evalX), H); ctx.stroke();
       ctx.setLineDash([]);
@@ -174,11 +240,15 @@ function Graph({ realFn, coeffs, center, evalX, numTerms }) {
     // Legend
     ctx.font = "bold 11px Consolas, 'Courier New', monospace";
     ctx.textAlign = "left";
-    ctx.fillStyle = "#f6c90e"; ctx.fillText("■ f(x)", 10, H - 26);
-    ctx.fillStyle = "#4ecdc4"; ctx.fillText(`╌ T${numTerms}(x)`, 10, H - 10);
-    ctx.fillStyle = "#c084fc"; ctx.fillText("● center a", 90, H - 10);
+    let ly = H - 10;
+    ctx.fillStyle = t.accent3; ctx.fillText("● center a", 90, ly);
+    ctx.fillStyle = t.accent2; ctx.fillText(`╌ T${numTerms}(x)`, 10, ly); ly -= 16;
+    ctx.fillStyle = t.accent; ctx.fillText("■ f(x)", 10, ly); ly -= 16;
+    if (showDeriv)  { ctx.fillStyle = t.derivColor;  ctx.fillText("╌ f′(x)", 10, ly); ly -= 16; }
+    if (showDeriv2) { ctx.fillStyle = t.deriv2Color; ctx.fillText("·· f″(x)", 10, ly); ly -= 16; }
+    if (showInteg)  { ctx.fillStyle = t.integColor;  ctx.fillText("╌ ∫f dx", 10, ly); }
 
-  }, [realFn, coeffs, center, evalX, numTerms]);
+  }, [realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Coeffs, showDeriv, showInteg, showDeriv2, theme]);
 
   const schedRedraw = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -259,6 +329,12 @@ export default function TaylorApp() {
   const [terms,      setTerms]      = useState(8);
   const [evalX,      setEvalX]      = useState(1.0);
   const [showSyntax, setShowSyntax] = useState(false);
+  const [themeMode,  setThemeMode]  = useState("dark");
+  const [showDeriv,  setShowDeriv]  = useState(false);
+  const [showDeriv2, setShowDeriv2] = useState(false);
+  const [showInteg,  setShowInteg]  = useState(false);
+
+  const t = THEMES[themeMode];
 
   // Parse + compile expression with mathjs
   const { compiled, realFn, parseErr } = useMemo(() => {
@@ -288,60 +364,84 @@ export default function TaylorApp() {
     return { coeffs: null, coeffErr: "Could not compute — try a different center point" };
   }, [compiled, center, terms]);
 
+  // Derivative / Integral / Second derivative coefficients
+  const dCoeffs  = useMemo(() => coeffs ? derivCoeffs(coeffs) : null, [coeffs]);
+  const d2Coeffs = useMemo(() => coeffs ? deriv2Coeffs(coeffs) : null, [coeffs]);
+  const iCoeffs  = useMemo(() => coeffs ? integCoeffs(coeffs) : null, [coeffs]);
+
   // Numerical results at evalX
-  const { approx, exact, pctErr } = useMemo(() => {
+  const { approx, exact, pctErr, derivVal, deriv2Val, integVal } = useMemo(() => {
     if (!coeffs || !realFn) return {};
     const approx = evalPoly(coeffs, center, evalX);
     const exact  = realFn(evalX);
     const pctErr = (isFinite(exact) && Math.abs(exact) > 1e-15)
       ? Math.abs((approx - exact) / exact) * 100 : NaN;
-    return { approx, exact, pctErr };
-  }, [coeffs, realFn, center, evalX]);
+    const derivVal  = dCoeffs  ? evalPoly(dCoeffs, center, evalX) : NaN;
+    const deriv2Val = d2Coeffs ? evalPoly(d2Coeffs, center, evalX) : NaN;
+    const integVal  = iCoeffs  ? evalPoly(iCoeffs, center, evalX) : NaN;
+    return { approx, exact, pctErr, derivVal, deriv2Val, integVal };
+  }, [coeffs, realFn, center, evalX, dCoeffs, d2Coeffs, iCoeffs]);
 
-  const errColor = !isFinite(pctErr) ? "#4a6a5a"
+  const errColor = !isFinite(pctErr) ? t.textDim
     : pctErr < 0.001 ? "#4ade80"
-    : pctErr < 1     ? "#f6c90e"
-    :                  "#f87171";
+    : pctErr < 1     ? t.accent
+    :                  t.red;
 
   return (
-    <div style={{ height: "100vh", background: "#07090e", color: "#c5cdd6",
+    <div style={{ height: "100vh", background: t.bg, color: t.text,
       fontFamily: "'Courier New', Consolas, monospace", display: "flex",
       flexDirection: "column", overflow: "hidden" }}>
       <style>{`
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        input { background: #0c1018; border: 1px solid #22303f; color: #c5cdd6;
+        input { background: ${t.inputBg}; border: 1px solid ${t.inputBorder}; color: ${t.text};
           font-family: inherit; font-size: 0.88rem; padding: 0.42rem 0.65rem;
           border-radius: 4px; outline: none; transition: border-color .15s; }
-        input:focus { border-color: #4ecdc4; box-shadow: 0 0 0 2px rgba(78,205,196,.12); }
+        input:focus { border-color: ${t.accent2}; box-shadow: 0 0 0 2px rgba(78,205,196,.12); }
         .lbl { font-size: 0.57rem; letter-spacing: .18em; text-transform: uppercase;
-          color: #2e4d3c; margin-bottom: .32rem; }
-        .tag { display:inline-block; padding:.16rem .48rem; background:#0c1018;
-          border:1px solid #22303f; border-radius:3px; font-size:.7rem; cursor:pointer;
-          color:#6a7e8e; transition:all .12s; }
-        .tag:hover { border-color:#4ecdc4; color:#4ecdc4; }
-        .tag.on  { border-color:#f6c90e; color:#f6c90e; background:rgba(246,201,14,.06); }
-        .vbox { background:#0c1018; border:1px solid #1c2a38; border-radius:5px; padding:.6rem .75rem; }
+          color: ${t.lblColor}; margin-bottom: .32rem; }
+        .tag { display:inline-block; padding:.16rem .48rem; background:${t.tagBg};
+          border:1px solid ${t.tagBorder}; border-radius:3px; font-size:.7rem; cursor:pointer;
+          color:${t.tagText}; transition:all .12s; }
+        .tag:hover { border-color:${t.accent2}; color:${t.accent2}; }
+        .tag.on  { border-color:${t.accent}; color:${t.accent}; background:rgba(246,201,14,.06); }
+        .vbox { background:${t.panel}; border:1px solid ${t.borderDim}; border-radius:5px; padding:.6rem .75rem; }
         .big  { font-size:1.1rem; font-weight:700; }
-        hr    { border:none; border-top:1px solid #121c28; }
+        hr    { border:none; border-top:1px solid ${t.borderPanel}; }
         ::-webkit-scrollbar { width:3px; }
-        ::-webkit-scrollbar-thumb { background:#22303f; }
+        ::-webkit-scrollbar-thumb { background:${t.scrollThumb}; }
         input[type=range] { padding:0; background:none; border:none; outline:none;
-          cursor:pointer; accent-color:#4ecdc4; }
+          cursor:pointer; accent-color:${t.accent2}; }
+        .calc-toggle { display:inline-flex; align-items:center; gap:.3rem; padding:.2rem .5rem;
+          background:${t.panel}; border:1px solid ${t.borderDim}; border-radius:4px;
+          font-size:.68rem; cursor:pointer; color:${t.tagText}; transition:all .12s;
+          user-select:none; }
+        .calc-toggle:hover { border-color:${t.accent2}; }
+        .calc-toggle.on { border-color:${t.accent}; color:${t.accent}; }
+        .theme-btn { background:${t.panel}; border:1px solid ${t.border}; border-radius:6px;
+          padding:.3rem .6rem; cursor:pointer; font-size:.75rem; color:${t.text};
+          font-family:inherit; transition:all .15s; display:flex; align-items:center; gap:.3rem; }
+        .theme-btn:hover { border-color:${t.accent2}; color:${t.accent2}; }
       `}</style>
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <div style={{ padding: ".5rem 1.1rem", borderBottom: "1px solid #121c28",
+      <div style={{ padding: ".5rem 1.1rem", borderBottom: `1px solid ${t.borderPanel}`,
         display: "flex", alignItems: "center", gap: "1rem", flexShrink: 0 }}>
         <div>
-          <div style={{ fontSize:".52rem", letterSpacing:".3em", color:"#1e3e2c", textTransform:"uppercase" }}>
+          <div style={{ fontSize:".52rem", letterSpacing:".3em", color:t.headerSub, textTransform:"uppercase" }}>
             Numerical Analysis
           </div>
-          <div style={{ fontSize:"1.05rem", fontWeight:700, color:"#dce8f0", letterSpacing:".04em" }}>
-            <span style={{ color:"#f6c90e" }}>Taylor</span> Polynomial Calculator
+          <div style={{ fontSize:"1.05rem", fontWeight:700, color:t.headerTitle, letterSpacing:".04em" }}>
+            <span style={{ color:t.accent }}>Taylor</span> Polynomial Calculator
           </div>
         </div>
-        <div style={{ marginLeft:"auto", fontSize:".62rem", color:"#2a4438", textAlign:"right" }}>
-          f(x) ≈ Σ cₙ·(x−a)ⁿ &nbsp;·&nbsp; Cauchy–DFT derivative method &nbsp;·&nbsp; up to 30 terms
+        <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:".8rem" }}>
+          <div style={{ fontSize:".62rem", color:t.headerInfo, textAlign:"right" }}>
+            f(x) ≈ Σ cₙ·(x−a)ⁿ &nbsp;·&nbsp; Cauchy–DFT derivative method &nbsp;·&nbsp; up to 30 terms
+          </div>
+          <button className="theme-btn"
+            onClick={() => setThemeMode(m => m === "dark" ? "light" : "dark")}>
+            {themeMode === "dark" ? "☀" : "🌙"} {themeMode === "dark" ? "Light" : "Dark"}
+          </button>
         </div>
       </div>
 
@@ -349,7 +449,7 @@ export default function TaylorApp() {
       <div style={{ flex:1, display:"grid", gridTemplateColumns:"290px 1fr", minHeight:0 }}>
 
         {/* ── Left sidebar ─────────────────────────────────────────────────── */}
-        <div style={{ borderRight:"1px solid #121c28", padding:".75rem", overflowY:"auto",
+        <div style={{ borderRight:`1px solid ${t.borderPanel}`, padding:".75rem", overflowY:"auto",
           display:"flex", flexDirection:"column", gap:".72rem" }}>
 
           {/* Function input */}
@@ -358,8 +458,8 @@ export default function TaylorApp() {
             <input value={expr} onChange={e => setExpr(e.target.value)}
               style={{ width:"100%", fontSize:".95rem" }}
               placeholder="sin(x^2) * exp(-x/3)" />
-            {parseErr && <div style={{ color:"#f87171", fontSize:".68rem", marginTop:".25rem" }}>⚠ {parseErr}</div>}
-            {coeffErr && <div style={{ color:"#fb923c", fontSize:".68rem", marginTop:".25rem" }}>⚠ {coeffErr}</div>}
+            {parseErr && <div style={{ color:t.red, fontSize:".68rem", marginTop:".25rem" }}>⚠ {parseErr}</div>}
+            {coeffErr && <div style={{ color:t.errOrange, fontSize:".68rem", marginTop:".25rem" }}>⚠ {coeffErr}</div>}
           </div>
 
           {/* Presets */}
@@ -377,7 +477,7 @@ export default function TaylorApp() {
 
           {/* Center a */}
           <div>
-            <div className="lbl">Expansion center <span style={{ color:"#c084fc" }}>a</span></div>
+            <div className="lbl">Expansion center <span style={{ color:t.accent3 }}>a</span></div>
             <input type="number" step="0.5" value={center}
               onChange={e => setCenter(parseFloat(e.target.value) || 0)}
               style={{ width:"100%" }} />
@@ -387,13 +487,13 @@ export default function TaylorApp() {
           <div>
             <div className="lbl">
               Number of terms &nbsp;
-              <span style={{ color:"#f6c90e", letterSpacing:0 }}>N = {terms}</span>
+              <span style={{ color:t.accent, letterSpacing:0 }}>N = {terms}</span>
             </div>
             <input type="range" min="1" max="30" value={terms}
               onChange={e => setTerms(+e.target.value)}
               style={{ width:"100%" }} />
             <div style={{ display:"flex", justifyContent:"space-between",
-              fontSize:".55rem", color:"#1e3020", marginTop:".1rem" }}>
+              fontSize:".55rem", color:t.textMuted, marginTop:".1rem" }}>
               <span>1</span><span>10</span><span>20</span><span>30</span>
             </div>
           </div>
@@ -402,7 +502,7 @@ export default function TaylorApp() {
 
           {/* Evaluate at x */}
           <div>
-            <div className="lbl">Evaluate at <span style={{ color:"#f6c90e" }}>x</span> =</div>
+            <div className="lbl">Evaluate at <span style={{ color:t.accent }}>x</span> =</div>
             <input type="number" step="0.1" value={evalX}
               onChange={e => setEvalX(parseFloat(e.target.value) ?? 0)}
               style={{ width:"100%" }} />
@@ -413,13 +513,13 @@ export default function TaylorApp() {
             <div style={{ display:"flex", flexDirection:"column", gap:".35rem" }}>
               <div className="vbox">
                 <div className="lbl" style={{ marginBottom:".12rem" }}>Taylor T({evalX})</div>
-                <div className="big" style={{ color:"#f6c90e" }}>
+                <div className="big" style={{ color:t.accent }}>
                   {isFinite(approx) ? approx.toPrecision(9) : "—"}
                 </div>
               </div>
               <div className="vbox">
                 <div className="lbl" style={{ marginBottom:".12rem" }}>Exact f({evalX})</div>
-                <div className="big" style={{ color:"#4ecdc4" }}>
+                <div className="big" style={{ color:t.accent2 }}>
                   {isFinite(exact) ? exact.toPrecision(9) : "—"}
                 </div>
               </div>
@@ -436,6 +536,63 @@ export default function TaylorApp() {
 
           <hr />
 
+          {/* ── Calculus Functions ──────────────────────────────────────────── */}
+          <div>
+            <div className="lbl">Calculus Functions</div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:".3rem", marginBottom:".4rem" }}>
+              <span className={`calc-toggle ${showDeriv ? "on" : ""}`}
+                onClick={() => setShowDeriv(s => !s)}>
+                <span style={{ color:t.derivColor }}>f′(x)</span> Derivative
+              </span>
+              <span className={`calc-toggle ${showDeriv2 ? "on" : ""}`}
+                onClick={() => setShowDeriv2(s => !s)}>
+                <span style={{ color:t.deriv2Color }}>f″(x)</span> 2nd Deriv
+              </span>
+              <span className={`calc-toggle ${showInteg ? "on" : ""}`}
+                onClick={() => setShowInteg(s => !s)}>
+                <span style={{ color:t.integColor }}>∫f dx</span> Integral
+              </span>
+            </div>
+
+            {/* Calculus values at evalX */}
+            {coeffs && (showDeriv || showDeriv2 || showInteg) && (
+              <div style={{ display:"flex", flexDirection:"column", gap:".3rem" }}>
+                {showDeriv && (
+                  <div className="vbox">
+                    <div className="lbl" style={{ marginBottom:".12rem" }}>
+                      f′({evalX}) <span style={{ textTransform:"none", letterSpacing:0 }}>— 1st derivative</span>
+                    </div>
+                    <div className="big" style={{ color:t.derivColor }}>
+                      {isFinite(derivVal) ? derivVal.toPrecision(9) : "—"}
+                    </div>
+                  </div>
+                )}
+                {showDeriv2 && (
+                  <div className="vbox">
+                    <div className="lbl" style={{ marginBottom:".12rem" }}>
+                      f″({evalX}) <span style={{ textTransform:"none", letterSpacing:0 }}>— 2nd derivative</span>
+                    </div>
+                    <div className="big" style={{ color:t.deriv2Color }}>
+                      {isFinite(deriv2Val) ? deriv2Val.toPrecision(9) : "—"}
+                    </div>
+                  </div>
+                )}
+                {showInteg && (
+                  <div className="vbox">
+                    <div className="lbl" style={{ marginBottom:".12rem" }}>
+                      ∫f dx at x={evalX} <span style={{ textTransform:"none", letterSpacing:0 }}>— from a={center}</span>
+                    </div>
+                    <div className="big" style={{ color:t.integColor }}>
+                      {isFinite(integVal) ? integVal.toPrecision(9) : "—"}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <hr />
+
           {/* Syntax reference */}
           <div>
             <div className="lbl" style={{ cursor:"pointer", userSelect:"none" }}
@@ -443,7 +600,7 @@ export default function TaylorApp() {
               {showSyntax ? "▼" : "▶"} &nbsp;Syntax Reference
             </div>
             {showSyntax && (
-              <div style={{ fontSize:".7rem", color:"#4a6a5a", lineHeight:2, marginTop:".4rem" }}>
+              <div style={{ fontSize:".7rem", color:t.textDim, lineHeight:2, marginTop:".4rem" }}>
                 {[
                   ["Arithmetic",  "+  −  *  /  ^  **  %"],
                   ["Powers",      "x^2  x^(1/3)  2^x  e^(-x^2)"],
@@ -456,10 +613,10 @@ export default function TaylorApp() {
                   ["Constants",   "pi  e  phi  tau  Infinity"],
                 ].map(([k, v]) => (
                   <div key={k}>
-                    <span style={{ color:"#f6c90e" }}>{k}:</span> {v}
+                    <span style={{ color:t.accent }}>{k}:</span> {v}
                   </div>
                 ))}
-                <div style={{ marginTop:".4rem", color:"#2e4d3c" }}>Examples:</div>
+                <div style={{ marginTop:".4rem", color:t.textMuted }}>Examples:</div>
                 {["sin(x^2) * exp(-x/2)",
                   "x^3 - 3*x + cos(pi*x)",
                   "exp(-x^2) * cosh(x)",
@@ -469,7 +626,7 @@ export default function TaylorApp() {
                   "factorial(floor(abs(x)))",
                   "sin(x) / (1 + x^2)",
                 ].map(ex => (
-                  <div key={ex} style={{ color:"#4ecdc4", paddingLeft:".5rem" }}>→ {ex}</div>
+                  <div key={ex} style={{ color:t.accent2, paddingLeft:".5rem" }}>→ {ex}</div>
                 ))}
               </div>
             )}
@@ -482,28 +639,31 @@ export default function TaylorApp() {
           {/* Canvas */}
           <div style={{ flex:1, position:"relative", minHeight:0 }}>
             <Graph realFn={realFn} coeffs={coeffs} center={center}
-                   evalX={evalX} numTerms={terms} />
+                   evalX={evalX} numTerms={terms}
+                   dCoeffs={dCoeffs} iCoeffs={iCoeffs} d2Coeffs={d2Coeffs}
+                   showDeriv={showDeriv} showInteg={showInteg} showDeriv2={showDeriv2}
+                   theme={t} />
             <div style={{ position:"absolute", top:8, right:10, fontSize:".58rem",
-              color:"rgba(255,255,255,.18)", textAlign:"right", pointerEvents:"none" }}>
+              color:t.hintColor, textAlign:"right", pointerEvents:"none" }}>
               scroll to zoom · drag to pan
             </div>
           </div>
 
           {/* Coefficient strip */}
           {coeffs && (
-            <div style={{ borderTop:"1px solid #121c28", padding:".45rem .8rem",
+            <div style={{ borderTop:`1px solid ${t.borderPanel}`, padding:".45rem .8rem",
               overflowX:"auto", flexShrink:0, maxHeight:"110px" }}>
               <div className="lbl" style={{ marginBottom:".35rem" }}>
                 Coefficients &nbsp; cₙ = f⁽ⁿ⁾(a) / n!
               </div>
               <div style={{ display:"flex", gap:".28rem", flexWrap:"wrap" }}>
                 {coeffs.map((c, n) => (
-                  <div key={n} style={{ background:"#0c1018", border:"1px solid #1c2a38",
+                  <div key={n} style={{ background:t.panel, border:`1px solid ${t.borderDim}`,
                     borderRadius:"4px", padding:".22rem .5rem", fontSize:".68rem",
                     whiteSpace:"nowrap" }}>
-                    <span style={{ color:"#c084fc" }}>c{n}</span>
-                    <span style={{ color:"#1c3028" }}>=</span>
-                    <span style={{ color: Math.abs(c) < 1e-12 ? "#22303f" : "#f6c90e" }}>
+                    <span style={{ color:t.accent3 }}>c{n}</span>
+                    <span style={{ color:t.borderDim }}>=</span>
+                    <span style={{ color: Math.abs(c) < 1e-12 ? t.dimCoeff : t.accent }}>
                       {Math.abs(c) < 1e-13 ? "0" : c.toPrecision(4)}
                     </span>
                   </div>
