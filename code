@@ -94,7 +94,7 @@ const THEMES = {
     errOrange: "#fb923c", lblColor: "#2e4d3c", dimCoeff: "#22303f",
     derivColor: "#f472b6", integColor: "#60a5fa", deriv2Color: "#fb923c",
     guideColor: "rgba(248,113,113,0.45)", hintColor: "rgba(255,255,255,.18)",
-    centerStroke: "#fff",
+    centerStroke: "#fff", successGreen: "#4ade80",
   },
   light: {
     bg: "#f5f5f5", text: "#1e293b", textDim: "#64748b", textMuted: "#94a3b8",
@@ -108,7 +108,7 @@ const THEMES = {
     errOrange: "#ea580c", lblColor: "#64748b", dimCoeff: "#cbd5e1",
     derivColor: "#db2777", integColor: "#2563eb", deriv2Color: "#ea580c",
     guideColor: "rgba(220,38,38,0.35)", hintColor: "rgba(0,0,0,.25)",
-    centerStroke: "#000",
+    centerStroke: "#000", successGreen: "#16a34a",
   },
 };
 
@@ -384,7 +384,7 @@ export default function TaylorApp() {
   }, [coeffs, realFn, center, evalX, dCoeffs, d2Coeffs, iCoeffs]);
 
   const errColor = !isFinite(pctErr) ? t.textDim
-    : pctErr < 0.001 ? "#4ade80"
+    : pctErr < 0.001 ? t.successGreen
     : pctErr < 1     ? t.accent
     :                  t.red;
 
