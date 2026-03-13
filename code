@@ -1,46 +1,48 @@
-import { useState, useMemo, useRef, useEffect, useCallback } from "react";
-import * as math from "mathjs";
+const { useState, useMemo, useRef, useEffect, useCallback } = React;
 
-// ─── DFT-based Taylor coefficients (Cauchy integral formula) ─────────────────
-// Evaluates f on a circle of radius r in the complex plane, then uses
-// the discrete Fourier transform to extract each Taylor coefficient.
-// c_n = f^(n)(a)/n! = (1/N·r^n) · Re[ Σ_k f(a + r·e^{2πik/N}) · e^{-2πikn/N} ]
-// This method is numerically stable for all n ≤ 30.
-function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024) {
+/* =========================================================================
+   MATH UTILITIES
+   ========================================================================= */
+
+function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024, extraScope = {}) {
   const fRe = new Float64Array(N);
   const fIm = new Float64Array(N);
   const TWO_PI_OVER_N = (2 * Math.PI) / N;
-
+  // Pre-compute cos/sin table for DFT to avoid redundant trig calls
+  const cosTable = new Float64Array(N);
+  const sinTable = new Float64Array(N);
   for (let k = 0; k < N; k++) {
     const theta = TWO_PI_OVER_N * k;
-    const zRe = a + r * Math.cos(theta);
-    const zIm = r * Math.sin(theta);
+    cosTable[k] = Math.cos(theta);
+    sinTable[k] = Math.sin(theta);
+    const zRe = a + r * cosTable[k];
+    const zIm = r * sinTable[k];
     try {
-      const val = compiled.evaluate({ x: math.complex(zRe, zIm) });
-      if (typeof val === "number")            { fRe[k] = val;    fIm[k] = 0; }
-      else if (val != null && "re" in val)    { fRe[k] = val.re; fIm[k] = val.im; }
-      else                                    { fRe[k] = NaN;    fIm[k] = 0; }
-    } catch { fRe[k] = NaN; fIm[k] = NaN; }
+      const val = compiled.evaluate({ x: math.complex(zRe, zIm), ...extraScope });
+      if (typeof val === "number")         { fRe[k] = val;    fIm[k] = 0; }
+      else if (val != null && "re" in val) { fRe[k] = val.re; fIm[k] = val.im; }
+      else                                 { fRe[k] = NaN;    fIm[k] = 0; }
+    } catch(e) { fRe[k] = NaN; fIm[k] = NaN; }
   }
-
-  const coeffs = [];
-  let rPow = 1; // r^n computed incrementally
+  const coeffs = new Array(numTerms);
+  let rPow = 1;
   for (let n = 0; n < numTerms; n++) {
     let re = 0;
-    const angleStep = -TWO_PI_OVER_N * n;
     for (let k = 0; k < N; k++) {
       if (!isFinite(fRe[k])) continue;
-      const angle = angleStep * k;
-      re += fRe[k] * Math.cos(angle) - fIm[k] * Math.sin(angle);
+      // angle = -TWO_PI_OVER_N * n * k — use trig identities with precomputed table
+      const nk = (n * k) % N;
+      const cosA = cosTable[nk];
+      const sinA = -sinTable[nk]; // negative angle
+      re += fRe[k] * cosA - fIm[k] * sinA;
     }
-    coeffs.push(re / (N * rPow));
+    coeffs[n] = re / (N * rPow);
     rPow *= r;
+    if (!isFinite(coeffs[n])) { coeffs[n] = 0; } // guard against underflow/overflow
   }
   return coeffs;
 }
 
-// ─── Evaluate Taylor polynomial at x (Horner's method) ───────────────────────
-// Evaluates Σ cₙ·(x−a)ⁿ from highest to lowest for numerical stability.
 function evalPoly(coeffs, a, x) {
   const dx = x - a;
   let sum = 0;
@@ -48,31 +50,24 @@ function evalPoly(coeffs, a, x) {
   return sum;
 }
 
-// ─── Derivative Taylor coefficients ───────────────────────────────────────────
-// If f(x) = Σ cₙ(x−a)ⁿ then f′(x) = Σ (n+1)·c_{n+1}·(x−a)ⁿ
 function derivCoeffs(coeffs) {
   const d = [];
   for (let n = 0; n < coeffs.length - 1; n++) d.push((n + 1) * coeffs[n + 1]);
   return d;
 }
 
-// ─── Integral Taylor coefficients ─────────────────────────────────────────────
-// If f(x) = Σ cₙ(x−a)ⁿ then ∫f dx = C + Σ cₙ/(n+1)·(x−a)^{n+1}
-// Here C = 0 (constant of integration)
 function integCoeffs(coeffs) {
-  const ig = [0]; // C = 0
+  const ig = [0];
   for (let n = 0; n < coeffs.length; n++) ig.push(coeffs[n] / (n + 1));
   return ig;
 }
 
-// ─── Nice round axis step size ────────────────────────────────────────────────
 function niceStep(target) {
   const p = Math.pow(10, Math.floor(Math.log10(Math.abs(target) || 1)));
   const f = target / p;
   return p * (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10);
 }
 
-// ─── Format a number concisely for axis labels ────────────────────────────────
 function fmt(n) {
   if (n === 0) return "0";
   const a = Math.abs(n);
@@ -80,14 +75,438 @@ function fmt(n) {
   return +n.toPrecision(3) + "";
 }
 
-// ─── Theme definitions ────────────────────────────────────────────────────────
+/* =========================================================================
+   RK4 ODE SOLVER
+   ========================================================================= */
+
+function solveODE_RK4(fExpr, x0, y0, xMin, xMax, h = 0.01) {
+  let compiled;
+  try { compiled = math.compile(fExpr); } catch(e) { return []; /* invalid expression — return empty solution */ }
+  const f = (x, y) => {
+    try {
+      const v = compiled.evaluate({ x, y });
+      return typeof v === "number" ? v : NaN;
+    } catch(e) { return NaN; }
+  };
+  const pts = [{ x: x0, y: y0 }];
+  let x = x0, y = y0;
+  while (x < xMax + h) {
+    const k1 = f(x, y);
+    const k2 = f(x + h/2, y + h*k1/2);
+    const k3 = f(x + h/2, y + h*k2/2);
+    const k4 = f(x + h, y + h*k3);
+    if (!isFinite(k1) || !isFinite(k2) || !isFinite(k3) || !isFinite(k4)) break;
+    y += (h/6) * (k1 + 2*k2 + 2*k3 + k4);
+    x += h;
+    if (!isFinite(y)) break;
+    pts.push({ x, y });
+  }
+  x = x0; y = y0;
+  const backPts = [];
+  while (x > xMin - h) {
+    const k1 = f(x, y);
+    const k2 = f(x - h/2, y - h*k1/2);
+    const k3 = f(x - h/2, y - h*k2/2);
+    const k4 = f(x - h, y - h*k3);
+    if (!isFinite(k1) || !isFinite(k2) || !isFinite(k3) || !isFinite(k4)) break;
+    y -= (h/6) * (k1 + 2*k2 + 2*k3 + k4);
+    x -= h;
+    if (!isFinite(y)) break;
+    backPts.push({ x, y });
+  }
+  backPts.reverse();
+  return [...backPts, ...pts];
+}
+
+/* =========================================================================
+   CALCULUS ENGINE — symbolic & numerical methods
+   Supports: derivatives, integrals, limits, sums, products, equation solving
+   ========================================================================= */
+
+// Adaptive Simpson's rule for numerical integration
+function adaptiveSimpson(f, a, b, tol, maxDepth) {
+  if (!isFinite(a) || !isFinite(b)) return NaN;
+  tol = tol || 1e-10;
+  maxDepth = maxDepth || 30;
+  function simpson(a, b) {
+    const c = (a + b) / 2;
+    const fa = f(a), fc = f(c), fb = f(b);
+    if (!isFinite(fa) || !isFinite(fc) || !isFinite(fb)) return NaN;
+    return ((b - a) / 6) * (fa + 4 * fc + fb);
+  }
+  function recurse(a, b, whole, depth) {
+    const c = (a + b) / 2;
+    const left = simpson(a, c);
+    const right = simpson(c, b);
+    if (!isFinite(left) || !isFinite(right)) return (isFinite(left) ? left : 0) + (isFinite(right) ? right : 0);
+    if (depth >= maxDepth || Math.abs(left + right - whole) <= 15 * tol) {
+      return left + right + (left + right - whole) / 15;
+    }
+    return recurse(a, c, left, depth + 1) + recurse(c, b, right, depth + 1);
+  }
+  if (a === b) return 0;
+  if (a > b) return -adaptiveSimpson(f, b, a, tol, maxDepth);
+  const whole = simpson(a, b);
+  if (!isFinite(whole)) return NaN;
+  return recurse(a, b, whole, 0);
+}
+
+// Numerical limit via Richardson extrapolation
+function numericalLimit(f, target, side) {
+  // side: 0=both, 1=right, -1=left
+  side = side || 0;
+  if (!isFinite(target)) return NaN;
+  function limitFromSide(dir) {
+    const hs = [];
+    const vals = [];
+    // Use moderate step sizes to avoid catastrophic cancellation
+    for (let k = 1; k <= 20; k++) {
+      const h = dir * Math.pow(0.5, k);
+      try {
+        const v = f(target + h);
+        if (!isFinite(v)) continue;
+        hs.push(Math.abs(h));
+        vals.push(v);
+      } catch(e) { continue; }
+    }
+    if (vals.length < 3) return NaN;
+    // Check direct convergence of raw values first (handles oscillatory functions)
+    const last3 = vals.slice(-3);
+    const spread = Math.max(...last3) - Math.min(...last3);
+    const directVal = vals[vals.length - 1];
+    // Richardson extrapolation table
+    let table = vals.slice();
+    let bestLen = table.length;
+    for (let j = 1; j < table.length; j++) {
+      const next = [];
+      for (let i = 0; i < table.length - j; i++) {
+        const r = hs[i] / hs[i + j];
+        if (Math.abs(r - 1) < 1e-15) continue; // avoid division by zero
+        const val = (r * table[i + 1] - table[i]) / (r - 1);
+        if (isFinite(val)) next.push(val);
+      }
+      if (next.length === 0) break;
+      table = next;
+      if (table.length <= 1) break;
+    }
+    const richVal = (table.length > 0 && isFinite(table[0])) ? table[0] : NaN;
+    // If Richardson diverged (result far from raw values), prefer direct convergence
+    if (isFinite(richVal) && spread < 0.1 * (1 + Math.abs(directVal))) {
+      if (Math.abs(richVal - directVal) > 10 * spread) return directVal;
+    }
+    return isFinite(richVal) ? richVal : (isFinite(directVal) ? directVal : NaN);
+  }
+  if (side > 0) return limitFromSide(1);
+  if (side < 0) return limitFromSide(-1);
+  const left = limitFromSide(-1);
+  const right = limitFromSide(1);
+  if (!isFinite(left) && !isFinite(right)) return NaN;
+  if (!isFinite(left)) return right;
+  if (!isFinite(right)) return left;
+  if (Math.abs(left - right) < 1e-8 * (1 + Math.abs(left))) return (left + right) / 2;
+  return NaN; // limit doesn't exist (left ≠ right)
+}
+
+// Newton-Raphson equation solver: find roots of f(x) = 0
+function solveEquation(exprText) {
+  let lhs = exprText, rhs = "0";
+  if (exprText.includes("=")) {
+    const parts = exprText.split("=");
+    lhs = parts[0].trim();
+    rhs = parts[1].trim();
+  }
+  const diffExpr = "(" + lhs + ")-(" + rhs + ")";
+  let compiled;
+  try { compiled = math.compile(diffExpr); } catch(e) { return { err: e.message }; }
+  const f = x => { try { const v = compiled.evaluate({ x }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+
+  // Try symbolic derivative for Newton's method
+  let df;
+  try {
+    const dNode = math.derivative(diffExpr, "x");
+    const dCompiled = dNode.compile ? dNode.compile() : math.compile(dNode.toString());
+    df = x => { try { const v = dCompiled.evaluate({ x }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+  } catch(e) {
+    // Fallback: numerical derivative
+    df = x => (f(x + 1e-8) - f(x - 1e-8)) / 2e-8;
+  }
+
+  const roots = [];
+  const seen = new Set();
+  // Scan range [-20, 20] for sign changes and try Newton from multiple starting points
+  const starts = [];
+  for (let x = -20; x <= 20; x += 0.25) starts.push(x);
+  // Also add points where sign changes
+  let prevVal = f(-20);
+  for (let x = -19.9; x <= 20; x += 0.1) {
+    const val = f(x);
+    if (isFinite(prevVal) && isFinite(val) && prevVal * val < 0) {
+      // Bisection to narrow down
+      let lo = x - 0.1, hi = x;
+      for (let i = 0; i < 60; i++) {
+        const mid = (lo + hi) / 2;
+        const fm = f(mid);
+        if (!isFinite(fm)) break;
+        const flo = f(lo);
+        if (!isFinite(flo)) break;
+        if (flo * fm < 0) hi = mid; else lo = mid;
+      }
+      const root = (lo + hi) / 2;
+      const key = root.toFixed(8);
+      if (!seen.has(key) && Math.abs(f(root)) < 1e-6) {
+        seen.add(key);
+        roots.push(root);
+      }
+    }
+    prevVal = val;
+  }
+  // Newton-Raphson from various starting points
+  for (const x0 of starts) {
+    let x = x0;
+    for (let i = 0; i < 100; i++) {
+      const fx = f(x);
+      const dfx = df(x);
+      if (!isFinite(fx) || !isFinite(dfx) || Math.abs(dfx) < 1e-15) break;
+      const xNew = x - fx / dfx;
+      if (!isFinite(xNew)) break;
+      if (Math.abs(xNew - x) < 1e-12) { x = xNew; break; }
+      x = xNew;
+    }
+    if (isFinite(x) && Math.abs(f(x)) < 1e-8) {
+      const key = x.toFixed(8);
+      if (!seen.has(key)) { seen.add(key); roots.push(x); }
+    }
+  }
+  roots.sort((a, b) => a - b);
+  return { roots };
+}
+
+// Preprocess expression text to handle calculus syntax before math.compile
+// Supported: diff(...), integrate(...), limit(...), sum(...), prod(...), solve(...)
+function preprocessCalculus(text) {
+  const trimmed = text.trim();
+
+  // diff(expr, var) or diff(expr, var, n) — symbolic derivative
+  let m = trimmed.match(/^diff\((.+),\s*([a-z]),?\s*(\d+)?\)$/i);
+  if (m) {
+    try {
+      let node = math.parse(m[1]);
+      const v = m[2];
+      const n = parseInt(m[3] || "1");
+      for (let i = 0; i < n; i++) node = math.derivative(node, v);
+      const simplified = math.simplify(node);
+      return { type: "symbolic", label: n > 1 ? `d${n}/d${v}${n}` : `d/d${v}`, result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // d/dx(...) — symbolic derivative shorthand
+  m = trimmed.match(/^d\/d([a-z])\((.+)\)$/i);
+  if (m) {
+    try {
+      const node = math.derivative(m[2], m[1]);
+      const simplified = math.simplify(node);
+      return { type: "symbolic", label: `d/d${m[1]}`, result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // integrate(expr, var, a, b) — definite integral
+  m = trimmed.match(/^integrate\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (!m) m = trimmed.match(/^int\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const a = math.evaluate(m[3]);
+      const b = math.evaluate(m[4]);
+      if (!isFinite(a) || !isFinite(b)) return { type: "error", result: "Invalid bounds: must be finite numbers" };
+      const f = t => { try { const v = compiled.evaluate({ [vName]: t }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+      const result = adaptiveSimpson(f, a, b);
+      return { type: "numeric", label: `∫[${m[3]},${m[4]}]`, result };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // limit(expr, var, target) or limit(expr, var, target, side)
+  m = trimmed.match(/^limit\((.+),\s*([a-z]),\s*(.+?)(?:,\s*(left|right|[+-]?[01]))?\)$/i);
+  if (!m) m = trimmed.match(/^lim\((.+),\s*([a-z]),\s*(.+?)(?:,\s*(left|right|[+-]?[01]))?\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const target = math.evaluate(m[3]);
+      let side = 0;
+      if (m[4]) {
+        const s = m[4].toLowerCase();
+        if (s === "right" || s === "1" || s === "+1") side = 1;
+        else if (s === "left" || s === "-1") side = -1;
+      }
+      const f = t => { try { const v = compiled.evaluate({ [vName]: t }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+      const result = numericalLimit(f, target, side);
+      return { type: "numeric", label: `lim(${vName}→${m[3]})`, result };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // sum(expr, var, start, end) — summation
+  m = trimmed.match(/^sum\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const start = Math.round(math.evaluate(m[3]));
+      const end = Math.round(math.evaluate(m[4]));
+      if (Math.abs(end - start) > 1e7) return { type: "error", result: "Sum range too large (max 10M terms)" };
+      let total = 0;
+      for (let i = start; i <= end; i++) {
+        const v = compiled.evaluate({ [vName]: i });
+        if (typeof v === "number") total += v;
+        else return { type: "error", result: "Non-numeric term in sum" };
+      }
+      return { type: "numeric", label: `Σ(${vName}=${start}..${end})`, result: total };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // prod(expr, var, start, end) — product
+  m = trimmed.match(/^prod\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const start = Math.round(math.evaluate(m[3]));
+      const end = Math.round(math.evaluate(m[4]));
+      if (Math.abs(end - start) > 1e7) return { type: "error", result: "Product range too large (max 10M terms)" };
+      let total = 1;
+      for (let i = start; i <= end; i++) {
+        const v = compiled.evaluate({ [vName]: i });
+        if (typeof v === "number") total *= v;
+        else return { type: "error", result: "Non-numeric term in product" };
+      }
+      return { type: "numeric", label: `Π(${vName}=${start}..${end})`, result: total };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // solve(expr) or solve(lhs = rhs) — find real roots
+  m = trimmed.match(/^solve\((.+)\)$/i);
+  if (m) {
+    const result = solveEquation(m[1]);
+    if (result.err) return { type: "error", result: result.err };
+    if (result.roots.length === 0) return { type: "solve", label: "solve", roots: [], result: "No real solutions found" };
+    return { type: "solve", label: "solve", roots: result.roots,
+      result: "x = " + result.roots.map(r => {
+        if (Math.abs(r) < 1e-12) return "0";
+        if (Number.isInteger(r)) return r.toString();
+        return r.toPrecision(10).replace(/\.?0+$/, "");
+      }).join(", ") };
+  }
+
+  // simplify(expr) — symbolic simplification
+  m = trimmed.match(/^simplify\((.+)\)$/i);
+  if (m) {
+    try {
+      const simplified = math.simplify(m[1]);
+      return { type: "symbolic", label: "simplify", result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // expand(expr) — symbolic expansion via rationalize
+  m = trimmed.match(/^expand\((.+)\)$/i);
+  if (m) {
+    try {
+      const expanded = math.rationalize(m[1]);
+      return { type: "symbolic", label: "expand", result: expanded.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // Equation with = sign (not inside a function call) — auto-solve
+  if (trimmed.includes("=") && !trimmed.match(/^(diff|integrate|int|limit|lim|sum|prod|solve|simplify|expand)\(/i)) {
+    const result = solveEquation(trimmed);
+    if (result.err) return null; // fall through to normal evaluation
+    if (result.roots.length > 0) {
+      return { type: "solve", label: "solve", roots: result.roots,
+        result: "x = " + result.roots.map(r => {
+          if (Math.abs(r) < 1e-12) return "0";
+          if (Number.isInteger(r)) return r.toString();
+          return r.toPrecision(10).replace(/\.?0+$/, "");
+        }).join(", ") };
+    }
+  }
+
+  return null; // not a calculus expression — use normal evaluation
+}
+
+/* =========================================================================
+   MATH OCR — recognize math from uploaded images
+   Uses Tesseract.js for OCR + post-processing for math syntax
+   ========================================================================= */
+
+function postProcessMathOCR(raw) {
+  let t = raw.trim();
+  // Normalize common OCR misreads and Unicode symbols
+  t = t.replace(/\u00d7/g, "*");      // ×
+  t = t.replace(/\u00f7/g, "/");      // ÷
+  t = t.replace(/\u2212/g, "-");      // −
+  t = t.replace(/\u2013/g, "-");      // –
+  t = t.replace(/\u2014/g, "-");      // —
+  t = t.replace(/\u00b2/g, "^2");     // ²
+  t = t.replace(/\u00b3/g, "^3");     // ³
+  t = t.replace(/\u221a/g, "sqrt");   // √
+  t = t.replace(/\u03c0/g, "pi");     // π
+  t = t.replace(/\u03b8/g, "x");      // θ → x
+  t = t.replace(/\u222b/g, "integrate"); // ∫
+  t = t.replace(/\u03a3/g, "sum");    // Σ
+  t = t.replace(/\u03a0/g, "prod");   // Π
+  t = t.replace(/\u221e/g, "Infinity"); // ∞
+  // Common OCR misreads
+  t = t.replace(/\bl\b(?=n\s*\()/g, "l");  // keep ln
+  t = t.replace(/\bIn\b/g, "ln");     // In → ln
+  t = t.replace(/\bIog\b/gi, "log");  // Iog → log
+  t = t.replace(/\bSin\b/g, "sin");
+  t = t.replace(/\bCos\b/g, "cos");
+  t = t.replace(/\bTan\b/g, "tan");
+  t = t.replace(/[{}[\]]/g, c => c === "{" || c === "[" ? "(" : ")");
+  // Remove stray characters
+  t = t.replace(/[|\\]/g, "");
+  // Collapse whitespace
+  t = t.replace(/\s+/g, " ").trim();
+  // Implicit multiplication: 2x → 2*x, )x → )*x, )( → )*(
+  t = t.replace(/(\d)([a-zA-Z(])/g, "$1*$2");
+  t = t.replace(/\)(\()/g, ")*(");
+  t = t.replace(/\)([a-zA-Z])/g, ")*$1");
+  return t;
+}
+
+async function recognizeMathFromImage(imageFile) {
+  if (typeof Tesseract === "undefined") {
+    return { error: "Tesseract.js not loaded" };
+  }
+  try {
+    const worker = await Tesseract.createWorker("eng", 1, {
+      corePath: "https://unpkg.com/tesseract.js-core@5.1.0/tesseract-core-simd-lstm.wasm.js",
+      workerPath: "https://unpkg.com/tesseract.js@5.1.1/dist/worker.min.js",
+    });
+    await worker.setParameters({
+      tessedit_char_whitelist: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-*/^().,=<>! ",
+      tessedit_pageseg_mode: "7",
+    });
+    const { data } = await worker.recognize(imageFile);
+    await worker.terminate();
+    const raw = data.text || "";
+    const processed = postProcessMathOCR(raw);
+    return { raw, processed };
+  } catch(e) {
+    return { error: e.message || "OCR failed" };
+  }
+}
+
+/* =========================================================================
+   THEMES
+   ========================================================================= */
+
 const THEMES = {
   dark: {
     bg: "#07090e", text: "#c5cdd6", textDim: "#4a6a5a", textMuted: "#2e4d3c",
     panel: "#0c1018", border: "#22303f", borderDim: "#1c2a38", borderPanel: "#121c28",
     accent: "#f6c90e", accent2: "#4ecdc4", accent3: "#c084fc", red: "#f87171",
     gridLine: "rgba(255,255,255,0.04)", axis: "rgba(255,255,255,0.2)",
-    axisLabel: "rgba(255,255,255,0.28)", legendBg: "transparent",
+    axisLabel: "rgba(255,255,255,0.28)",
     tagBg: "#0c1018", tagBorder: "#22303f", tagText: "#6a7e8e",
     inputBg: "#0c1018", inputBorder: "#22303f", scrollThumb: "#22303f",
     headerSub: "#1e3e2c", headerTitle: "#dce8f0", headerInfo: "#2a4438",
@@ -95,13 +514,16 @@ const THEMES = {
     derivColor: "#f472b6", integColor: "#60a5fa", deriv2Color: "#fb923c",
     guideColor: "rgba(248,113,113,0.45)", hintColor: "rgba(255,255,255,.18)",
     centerStroke: "#fff", successGreen: "#4ade80",
+    sidebarBg: "#0a0e16", exprCardBg: "#0f1520", exprCardBorder: "#1a2535",
+    kbBg: "#0f1520", kbBtnBg: "#151d2b", kbBtnBorder: "#22303f",
+    kbBtnHover: "#1d2940", odeColor: "#e879f9",
   },
   light: {
     bg: "#f5f5f5", text: "#1e293b", textDim: "#64748b", textMuted: "#94a3b8",
     panel: "#ffffff", border: "#cbd5e1", borderDim: "#e2e8f0", borderPanel: "#e2e8f0",
     accent: "#b45309", accent2: "#0d9488", accent3: "#7c3aed", red: "#dc2626",
     gridLine: "rgba(0,0,0,0.06)", axis: "rgba(0,0,0,0.25)",
-    axisLabel: "rgba(0,0,0,0.4)", legendBg: "transparent",
+    axisLabel: "rgba(0,0,0,0.4)",
     tagBg: "#ffffff", tagBorder: "#cbd5e1", tagText: "#475569",
     inputBg: "#ffffff", inputBorder: "#cbd5e1", scrollThumb: "#cbd5e1",
     headerSub: "#64748b", headerTitle: "#0f172a", headerInfo: "#64748b",
@@ -109,13 +531,219 @@ const THEMES = {
     derivColor: "#db2777", integColor: "#2563eb", deriv2Color: "#ea580c",
     guideColor: "rgba(220,38,38,0.35)", hintColor: "rgba(0,0,0,.25)",
     centerStroke: "#000", successGreen: "#16a34a",
+    sidebarBg: "#f0f0f0", exprCardBg: "#ffffff", exprCardBorder: "#dce1e8",
+    kbBg: "#f8f9fa", kbBtnBg: "#ffffff", kbBtnBorder: "#d1d5db",
+    kbBtnHover: "#e5e7eb", odeColor: "#a855f7",
   },
 };
 
-// ─── Desmos-style canvas graph ────────────────────────────────────────────────
-function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Coeffs, showDeriv, showInteg, showDeriv2, theme }) {
+const COLOR_PALETTE = ["#2d70b3","#c74440","#388c46","#6042a6","#000000","#fa7e19","#c7519c","#862d86"];
+
+/* =========================================================================
+   PRESETS
+   ========================================================================= */
+
+const PRESETS = [
+  ["sin(x)", 0],       ["cos(x)", 0],       ["exp(x)", 0],
+  ["ln(x)", 1],        ["tan(x)", 0],        ["sqrt(x)", 1],
+  ["1/(1-x)", 0],      ["atan(x)", 0],       ["sinh(x)", 0],
+  ["cosh(x)", 0],      ["tanh(x)", 0],       ["exp(-x^2)", 0],
+  ["x^2*sin(x)", 0],   ["1/(1+x^2)", 0],     ["log(x,10)", 1],
+  ["x*cos(pi*x)", 0],  ["cbrt(x)", 0],       ["sin(x)/x", 1],
+];
+
+/* =========================================================================
+   VIRTUAL MATH KEYBOARD
+   ========================================================================= */
+
+/* =========================================================================
+   DESMOS-STYLE KEYBOARD — all sections
+   Tabs: 123, functions, ABC, αβγ (Greek), misc
+   ========================================================================= */
+
+const KB_123 = [
+  [
+    { label: "\u00b9\u2044\u2093", insert: "/" },
+    { label: "x\u00b2", insert: "^2" },
+    { label: "x\u02b8", insert: "^" },
+    { label: "\u221a", insert: "sqrt(" },
+    { label: "\u221b", insert: "cbrt(" },
+    { label: "\u207f\u221a", insert: "nthRoot(" },
+  ],
+  [
+    { label: "7", insert: "7" }, { label: "8", insert: "8" }, { label: "9", insert: "9" },
+    { label: "\u00f7", insert: "/" }, { label: "(", insert: "(" }, { label: ")", insert: ")" },
+  ],
+  [
+    { label: "4", insert: "4" }, { label: "5", insert: "5" }, { label: "6", insert: "6" },
+    { label: "\u00d7", insert: "*" }, { label: "|a|", insert: "abs(" }, { label: "\u03c0", insert: "pi" },
+  ],
+  [
+    { label: "1", insert: "1" }, { label: "2", insert: "2" }, { label: "3", insert: "3" },
+    { label: "\u2212", insert: "-" }, { label: ",", insert: ", " }, { label: "e", insert: "e" },
+  ],
+  [
+    { label: "0", insert: "0" }, { label: ".", insert: "." }, { label: "=", insert: "=" },
+    { label: "+", insert: "+" }, { label: "x", insert: "x" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_FUNC = [
+  [
+    { label: "sin", insert: "sin(" }, { label: "cos", insert: "cos(" },
+    { label: "tan", insert: "tan(" }, { label: "csc", insert: "csc(" },
+    { label: "sec", insert: "sec(" }, { label: "cot", insert: "cot(" },
+  ],
+  [
+    { label: "sin\u207b\u00b9", insert: "asin(" }, { label: "cos\u207b\u00b9", insert: "acos(" },
+    { label: "tan\u207b\u00b9", insert: "atan(" }, { label: "csc\u207b\u00b9", insert: "acsc(" },
+    { label: "sec\u207b\u00b9", insert: "asec(" }, { label: "cot\u207b\u00b9", insert: "acot(" },
+  ],
+  [
+    { label: "sinh", insert: "sinh(" }, { label: "cosh", insert: "cosh(" },
+    { label: "tanh", insert: "tanh(" }, { label: "csch", insert: "csch(" },
+    { label: "sech", insert: "sech(" }, { label: "coth", insert: "coth(" },
+  ],
+  [
+    { label: "ln", insert: "ln(" }, { label: "log", insert: "log(" },
+    { label: "exp", insert: "exp(" }, { label: "n!", insert: "factorial(" },
+    { label: "nCr", insert: "combinations(" }, { label: "nPr", insert: "permutations(" },
+  ],
+  [
+    { label: "floor", insert: "floor(" }, { label: "ceil", insert: "ceil(" },
+    { label: "round", insert: "round(" }, { label: "sign", insert: "sign(" },
+    { label: "min", insert: "min(" }, { label: "max", insert: "max(" },
+  ],
+  [
+    { label: "mod", insert: "mod(" }, { label: "gcd", insert: "gcd(" },
+    { label: "lcm", insert: "lcm(" }, { label: "rand", insert: "random()" },
+    { label: "(", insert: "(" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_ABC = [
+  [
+    { label: "a", insert: "a" }, { label: "b", insert: "b" }, { label: "c", insert: "c" },
+    { label: "d", insert: "d" }, { label: "e", insert: "e" }, { label: "f", insert: "f" },
+    { label: "g", insert: "g" },
+  ],
+  [
+    { label: "h", insert: "h" }, { label: "i", insert: "i" }, { label: "j", insert: "j" },
+    { label: "k", insert: "k" }, { label: "l", insert: "l" }, { label: "m", insert: "m" },
+    { label: "n", insert: "n" },
+  ],
+  [
+    { label: "o", insert: "o" }, { label: "p", insert: "p" }, { label: "q", insert: "q" },
+    { label: "r", insert: "r" }, { label: "s", insert: "s" }, { label: "t", insert: "t" },
+    { label: "u", insert: "u" },
+  ],
+  [
+    { label: "v", insert: "v" }, { label: "w", insert: "w" }, { label: "x", insert: "x" },
+    { label: "y", insert: "y" }, { label: "z", insert: "z" }, { label: "_", insert: "_" },
+    { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_GREEK = [
+  [
+    { label: "\u03b1", insert: "alpha" }, { label: "\u03b2", insert: "beta" },
+    { label: "\u03b3", insert: "gamma" }, { label: "\u03b4", insert: "delta" },
+    { label: "\u03b5", insert: "epsilon" }, { label: "\u03b6", insert: "zeta" },
+  ],
+  [
+    { label: "\u03b7", insert: "eta" }, { label: "\u03b8", insert: "theta" },
+    { label: "\u03b9", insert: "iota" }, { label: "\u03ba", insert: "kappa" },
+    { label: "\u03bb", insert: "lambda" }, { label: "\u03bc", insert: "mu" },
+  ],
+  [
+    { label: "\u03bd", insert: "nu" }, { label: "\u03be", insert: "xi" },
+    { label: "\u03c0", insert: "pi" }, { label: "\u03c1", insert: "rho" },
+    { label: "\u03c3", insert: "sigma" }, { label: "\u03c4", insert: "tau" },
+  ],
+  [
+    { label: "\u03c5", insert: "upsilon" }, { label: "\u03c6", insert: "phi" },
+    { label: "\u03c7", insert: "chi" }, { label: "\u03c8", insert: "psi" },
+    { label: "\u03c9", insert: "omega" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_MISC = [
+  [
+    { label: "\u2264", insert: "<=" }, { label: "\u2265", insert: ">=" },
+    { label: "<", insert: "<" }, { label: ">", insert: ">" },
+    { label: "\u2260", insert: "!=" }, { label: "=", insert: "=" },
+  ],
+  [
+    { label: "d/dx", insert: "d/dx(" }, { label: "\u222b", insert: "integrate(" },
+    { label: "lim", insert: "limit(" }, { label: "\u03a3", insert: "sum(" },
+    { label: "\u03a0", insert: "prod(" }, { label: "solve", insert: "solve(" },
+  ],
+  [
+    { label: "diff", insert: "diff(" }, { label: "simpl", insert: "simplify(" },
+    { label: "expand", insert: "expand(" }, { label: "\u221e", insert: "Infinity" },
+    { label: "true", insert: "true" }, { label: "false", insert: "false" },
+  ],
+  [
+    { label: "[", insert: "[" }, { label: "]", insert: "]" },
+    { label: "{", insert: "{" }, { label: "}", insert: "}" },
+    { label: ";", insert: ";" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_TABS = [
+  { key: "123", label: "123", rows: KB_123, cols: 6 },
+  { key: "func", label: "f(x)", rows: KB_FUNC, cols: 6 },
+  { key: "abc", label: "ABC", rows: KB_ABC, cols: 7 },
+  { key: "greek", label: "\u03b1\u03b2\u03b3", rows: KB_GREEK, cols: 6 },
+  { key: "misc", label: "\u2234", rows: KB_MISC, cols: 6 },
+];
+
+const MathKeyboard = React.memo(function MathKeyboard({ theme: t, onKey }) {
+  const [tab, setTab] = React.useState("123");
+  const active = KB_TABS.find(tb => tb.key === tab) || KB_TABS[0];
+  return (
+    <div style={{ background: t.kbBg, border: `1px solid ${t.borderDim}`, padding: ".4rem",
+      display: "flex", flexDirection: "column", gap: ".3rem", borderRadius: "8px" }}>
+      <div style={{ display: "flex", gap: ".2rem", marginBottom: ".1rem" }}>
+        {KB_TABS.map(tb => (
+          <button key={tb.key} onClick={() => setTab(tb.key)}
+            style={{ flex: 1, background: tab === tb.key ? t.accent2 : t.kbBtnBg,
+              border: `1px solid ${tab === tb.key ? t.accent2 : t.kbBtnBorder}`, borderRadius: "5px",
+              padding: ".22rem .1rem", cursor: "pointer",
+              color: tab === tb.key ? "#fff" : t.text,
+              fontFamily: "inherit", fontSize: ".6rem", fontWeight: 700 }}>
+            {tb.label}
+          </button>
+        ))}
+      </div>
+      {active.rows.map((row, ri) => (
+        <div key={ri} style={{ display: "grid", gridTemplateColumns: `repeat(${active.cols}, 1fr)`, gap: ".22rem" }}>
+          {row.map((btn, bi) => (
+            <button key={bi}
+              onMouseDown={e => { e.preventDefault(); onKey(btn.insert); }}
+              style={{
+                background: t.kbBtnBg, border: `1px solid ${t.kbBtnBorder}`,
+                borderRadius: "6px", padding: ".36rem .08rem", cursor: "pointer",
+                color: t.text, fontFamily: "inherit", fontSize: ".68rem", fontWeight: 600,
+              }}
+              onMouseEnter={e => { e.currentTarget.style.background = t.kbBtnHover; }}
+              onMouseLeave={e => { e.currentTarget.style.background = t.kbBtnBg; }}
+            >{btn.label}</button>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+});  // React.memo(MathKeyboard)
+
+/* =========================================================================
+   GRAPH COMPONENT (multi-function + ODE) — wrapped in React.memo
+   ========================================================================= */
+
+const Graph = React.memo(function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDeriv2,
+                  odeCurve, odeVisible, theme }) {
   const canvasRef = useRef(null);
-  const viewRef   = useRef({ cx: 0, cy: 0, scale: 80 }); // world px/unit
+  const viewRef   = useRef({ cx: 0, cy: 0, scale: 80 });
   const dragRef   = useRef(null);
   const rafRef    = useRef(null);
 
@@ -123,10 +751,11 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
     const cv = canvasRef.current;
     if (!cv) return;
     const ctx = cv.getContext("2d");
+    if (!ctx) return;
     const W = cv.width, H = cv.height;
+    if (W === 0 || H === 0) return;
     const { cx, cy, scale: S } = viewRef.current;
 
-    // coordinate transforms
     const sx = wx => (wx - cx) * S + W / 2;
     const sy = wy => H / 2 - (wy - cy) * S;
     const wx = px => (px - W / 2) / S + cx;
@@ -134,15 +763,13 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
 
     const t = theme;
 
-    // Background
     ctx.fillStyle = t.bg;
     ctx.fillRect(0, 0, W, H);
 
-    // Grid lines
+    // Grid
     const step = niceStep(100 / S);
     const x0 = Math.floor(wx(0) / step) * step;
     const y0 = Math.floor(wy(H) / step) * step;
-
     ctx.lineWidth = 1;
     ctx.strokeStyle = t.gridLine;
     ctx.beginPath();
@@ -157,19 +784,18 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
     // Axes
     const axY = Math.max(1, Math.min(H - 1, sy(0)));
     const axX = Math.max(1, Math.min(W - 1, sx(0)));
-    ctx.strokeStyle = t.axis;
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = t.axis; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.moveTo(0, axY); ctx.lineTo(W, axY); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(axX, 0); ctx.lineTo(axX, H); ctx.stroke();
 
-    // Axis arrows
+    // Arrows
     ctx.fillStyle = t.axis;
-    ctx.beginPath(); ctx.moveTo(W - 2, axY); ctx.lineTo(W - 11, axY - 5); ctx.lineTo(W - 11, axY + 5); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(axX, 2);     ctx.lineTo(axX - 5, 11);      ctx.lineTo(axX + 5, 11);      ctx.fill();
+    ctx.beginPath(); ctx.moveTo(W-2,axY); ctx.lineTo(W-11,axY-5); ctx.lineTo(W-11,axY+5); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(axX,2); ctx.lineTo(axX-5,11); ctx.lineTo(axX+5,11); ctx.fill();
 
     // Axis labels
     ctx.fillStyle = t.axisLabel;
-    ctx.font = "10px Consolas, 'Courier New', monospace";
+    ctx.font = "bold 10px Consolas, 'Courier New', monospace";
     ctx.textAlign = "center";
     for (let gx = x0; gx < wx(W) + step; gx += step) {
       if (Math.abs(gx) < step * 0.01) continue;
@@ -181,11 +807,11 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
       ctx.fillText(fmt(gy), Math.max(axX - 5, 30), sy(gy) + 3);
     }
 
-    // Plot function helper (clips discontinuities)
-    const plotFn = (fn, color, lw, dash = []) => {
+    // Plot helper
+    const plotFn = (fn, color, lw, dash) => {
       ctx.strokeStyle = color;
       ctx.lineWidth = lw;
-      ctx.setLineDash(dash);
+      ctx.setLineDash(dash || []);
       ctx.beginPath();
       let pen = false, prevPy = null;
       const SAMPLES = W * 2;
@@ -193,47 +819,71 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
         const px = (i / SAMPLES) * W;
         const wX = wx(px);
         let wY;
-        try { wY = fn(wX); } catch { pen = false; prevPy = null; continue; }
+        try { wY = fn(wX); } catch(e) { pen = false; prevPy = null; continue; }
         if (!isFinite(wY)) { pen = false; prevPy = null; continue; }
         const pY = sy(wY);
         if (prevPy !== null && Math.abs(pY - prevPy) > H * 1.5) { pen = false; }
         if (!pen) { ctx.moveTo(px, pY); pen = true; }
-        else        ctx.lineTo(px, pY);
+        else ctx.lineTo(px, pY);
         prevPy = pY;
       }
       ctx.stroke();
       ctx.setLineDash([]);
     };
 
-    // Draw exact function (gold) and Taylor approx (teal dashed)
-    if (realFn)       plotFn(realFn, t.accent, 2.5);
-    if (coeffs?.length) plotFn(x => evalPoly(coeffs, center, x), t.accent2, 2, [8, 4]);
+    // Plot each visible expression
+    exprData.forEach(ed => {
+      if (!ed.visible) return;
+      if (ed.realFn) plotFn(ed.realFn, ed.color, 2.5);
+      if (ed.showTaylor && ed.coeffs && ed.coeffs.length) {
+        const cc = ed.coeffs, cn = center;
+        plotFn(x => evalPoly(cc, cn, x), ed.color + "80", 2, [8, 4]);
+      }
+      if (showDeriv && ed.dCoeffs && ed.dCoeffs.length) {
+        const cc = ed.dCoeffs, cn = center;
+        plotFn(x => evalPoly(cc, cn, x), t.derivColor, 1.8, [6, 3]);
+      }
+      if (showDeriv2 && ed.d2Coeffs && ed.d2Coeffs.length) {
+        const cc = ed.d2Coeffs, cn = center;
+        plotFn(x => evalPoly(cc, cn, x), t.deriv2Color, 1.5, [3, 3]);
+      }
+      if (showInteg && ed.iCoeffs && ed.iCoeffs.length) {
+        const cc = ed.iCoeffs, cn = center;
+        plotFn(x => evalPoly(cc, cn, x), t.integColor, 1.8, [8, 3, 2, 3]);
+      }
+    });
 
-    // Draw derivative curve (pink dashed)
-    if (showDeriv && dCoeffs?.length)
-      plotFn(x => evalPoly(dCoeffs, center, x), t.derivColor, 1.8, [6, 3]);
-
-    // Draw second derivative curve (orange dotted)
-    if (showDeriv2 && d2Coeffs?.length)
-      plotFn(x => evalPoly(d2Coeffs, center, x), t.deriv2Color, 1.5, [3, 3]);
-
-    // Draw integral curve (blue dash-dot)
-    if (showInteg && iCoeffs?.length)
-      plotFn(x => evalPoly(iCoeffs, center, x), t.integColor, 1.8, [8, 3, 2, 3]);
-
-    // Expansion center marker (purple dot)
-    const cval = realFn ? realFn(center) : 0;
-    if (isFinite(cval)) {
-      ctx.beginPath(); ctx.arc(sx(center), sy(cval), 6, 0, 6.283);
-      ctx.fillStyle = t.accent3; ctx.fill();
-      ctx.strokeStyle = t.centerStroke; ctx.lineWidth = 1.5; ctx.stroke();
+    // ODE curve
+    if (odeVisible && odeCurve && odeCurve.length > 1) {
+      ctx.strokeStyle = t.odeColor;
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      let started = false;
+      for (const pt of odeCurve) {
+        if (!isFinite(pt.x) || !isFinite(pt.y)) { started = false; continue; }
+        const ppx = sx(pt.x), ppy = sy(pt.y);
+        if (!started) { ctx.moveTo(ppx, ppy); started = true; }
+        else ctx.lineTo(ppx, ppy);
+      }
+      ctx.stroke();
     }
 
-    // evalX vertical guide
+    // Center marker
+    const firstVis = exprData.find(e => e.visible && e.realFn);
+    if (firstVis) {
+      const cval = firstVis.realFn(center);
+      if (isFinite(cval)) {
+        ctx.beginPath(); ctx.arc(sx(center), sy(cval), 6, 0, 6.283);
+        ctx.fillStyle = t.accent3; ctx.fill();
+        ctx.strokeStyle = t.centerStroke; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+    }
+
+    // evalX guide
     if (evalX !== null && isFinite(evalX)) {
       ctx.setLineDash([4, 4]);
-      ctx.strokeStyle = t.guideColor;
-      ctx.lineWidth = 1;
+      ctx.strokeStyle = t.guideColor; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(sx(evalX), 0); ctx.lineTo(sx(evalX), H); ctx.stroke();
       ctx.setLineDash([]);
     }
@@ -242,21 +892,26 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
     ctx.font = "bold 11px Consolas, 'Courier New', monospace";
     ctx.textAlign = "left";
     let ly = H - 10;
-    ctx.fillStyle = t.accent3; ctx.fillText("● center a", 90, ly);
-    ctx.fillStyle = t.accent2; ctx.fillText(`╌ T${numTerms}(x)`, 10, ly); ly -= 16;
-    ctx.fillStyle = t.accent; ctx.fillText("■ f(x)", 10, ly); ly -= 16;
-    if (showDeriv)  { ctx.fillStyle = t.derivColor;  ctx.fillText("╌ f′(x)", 10, ly); ly -= 16; }
-    if (showDeriv2) { ctx.fillStyle = t.deriv2Color; ctx.fillText("·· f″(x)", 10, ly); ly -= 16; }
-    if (showInteg)  { ctx.fillStyle = t.integColor;  ctx.fillText("╌ ∫f dx", 10, ly); }
-
-  }, [realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Coeffs, showDeriv, showInteg, showDeriv2, theme]);
+    ctx.fillStyle = t.accent3; ctx.fillText("\u25cf center a", 90, ly);
+    exprData.forEach(ed => {
+      if (!ed.visible) return;
+      ctx.fillStyle = ed.color;
+      const lbl = ed.text.length > 18 ? ed.text.slice(0, 16) + "\u2026" : ed.text;
+      ctx.fillText("\u25a0 " + lbl, 10, ly); ly -= 16;
+    });
+    if (showDeriv)  { ctx.fillStyle = t.derivColor;  ctx.fillText("\u256c f\u2032(x)", 10, ly); ly -= 16; }
+    if (showDeriv2) { ctx.fillStyle = t.deriv2Color; ctx.fillText("\u00b7\u00b7 f\u2033(x)", 10, ly); ly -= 16; }
+    if (showInteg)  { ctx.fillStyle = t.integColor;  ctx.fillText("\u256c \u222bf dx", 10, ly); ly -= 16; }
+    if (odeVisible && odeCurve && odeCurve.length) {
+      ctx.fillStyle = t.odeColor; ctx.fillText("\u25a0 ODE solution", 10, ly);
+    }
+  }, [exprData, center, evalX, numTerms, showDeriv, showInteg, showDeriv2, odeCurve, odeVisible, theme]);
 
   const schedRedraw = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(redraw);
   }, [redraw]);
 
-  // Canvas resize
   useEffect(() => {
     const cv = canvasRef.current;
     if (!cv) return;
@@ -271,19 +926,20 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
 
   useEffect(() => schedRedraw(), [schedRedraw]);
 
-  // Zoom on wheel (centered at cursor)
   const onWheel = useCallback(e => {
     e.preventDefault();
     const cv = canvasRef.current;
+    if (!cv) return;
     const rect = cv.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const { cx, cy, scale } = viewRef.current;
+    if (!scale || scale <= 0) return;
     const W = cv.width, H = cv.height;
     const f = e.deltaY < 0 ? 1.2 : 0.833;
-    const wMx = (mx - W / 2) / scale + cx;
-    const wMy = (H / 2 - my) / scale + cy;
-    const ns = Math.max(4, Math.min(2e5, scale * f));
-    viewRef.current = { cx: wMx - (mx - W / 2) / ns, cy: wMy + (my - H / 2) / ns, scale: ns };
+    const wMx = (mx - W/2) / scale + cx;
+    const wMy = (H/2 - my) / scale + cy;
+    const ns = Math.max(1e-12, Math.min(1e12, scale * f));
+    viewRef.current = { cx: wMx - (mx - W/2)/ns, cy: wMy + (my - H/2)/ns, scale: ns };
     schedRedraw();
   }, [schedRedraw]);
 
@@ -294,99 +950,287 @@ function Graph({ realFn, coeffs, center, evalX, numTerms, dCoeffs, iCoeffs, d2Co
     return () => cv.removeEventListener("wheel", onWheel);
   }, [onWheel]);
 
-  // Pan on drag
-  const onDown  = e => { dragRef.current = { x: e.clientX, y: e.clientY, ...viewRef.current }; };
-  const onMove  = e => {
+  const onDown = useCallback(e => { dragRef.current = { x: e.clientX, y: e.clientY, ...viewRef.current }; }, []);
+  const onMove = useCallback(e => {
     if (!dragRef.current) return;
     const { x, y, cx, cy, scale } = dragRef.current;
     viewRef.current.cx = cx - (e.clientX - x) / scale;
     viewRef.current.cy = cy + (e.clientY - y) / scale;
     schedRedraw();
-  };
-  const onUp    = () => { dragRef.current = null; };
+  }, [schedRedraw]);
+  const onUp = useCallback(() => { dragRef.current = null; }, []);
+
+  const canvasStyle = useMemo(() => ({ display: "block", width: "100%", height: "100%", cursor: "crosshair", touchAction: "none" }), []);
+
+  // Touch support for mobile
+  const onTouchStart = useCallback(e => {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      dragRef.current = { x: t.clientX, y: t.clientY, ...viewRef.current };
+    }
+  }, []);
+  const onTouchMove = useCallback(e => {
+    e.preventDefault();
+    if (!dragRef.current || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const { x, y, cx, cy, scale } = dragRef.current;
+    viewRef.current.cx = cx - (t.clientX - x) / scale;
+    viewRef.current.cy = cy + (t.clientY - y) / scale;
+    schedRedraw();
+  }, [schedRedraw]);
+  const onTouchEnd = useCallback(() => { dragRef.current = null; }, []);
 
   return (
     <canvas ref={canvasRef}
-      style={{ display: "block", width: "100%", height: "100%", cursor: "crosshair" }}
+      style={canvasStyle}
       onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+      onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
     />
   );
-}
+});  // React.memo(Graph)
 
-// ─── Preset library ───────────────────────────────────────────────────────────
-const PRESETS = [
-  ["sin(x)", 0],         ["cos(x)", 0],         ["exp(x)", 0],
-  ["ln(x)", 1],          ["tan(x)", 0],          ["sqrt(x)", 1],
-  ["1/(1-x)", 0],        ["atan(x)", 0],         ["sinh(x)", 0],
-  ["cosh(x)", 0],        ["tanh(x)", 0],         ["exp(-x^2)", 0],
-  ["x^2*sin(x)", 0],     ["1/(1+x^2)", 0],       ["log(x,10)", 1],
-  ["x*cos(pi*x)", 0],    ["cbrt(x)", 0],         ["sin(x)/x", 1],
-];
+/* =========================================================================
+   MAIN APP
+   ========================================================================= */
 
-// ─── Main component ───────────────────────────────────────────────────────────
-export default function TaylorApp() {
-  const [expr,       setExpr]       = useState("sin(x)");
-  const [center,     setCenter]     = useState(0);
-  const [terms,      setTerms]      = useState(8);
-  const [evalX,      setEvalX]      = useState(1.0);
-  const [showSyntax, setShowSyntax] = useState(false);
-  const [themeMode,  setThemeMode]  = useState("dark");
-  const [showDeriv,  setShowDeriv]  = useState(false);
-  const [showDeriv2, setShowDeriv2] = useState(false);
-  const [showInteg,  setShowInteg]  = useState(false);
+let nextExpressionId = 2;
+
+function TaylorApp() {
+  const [expressions, setExpressions] = useState([
+    { id: 1, text: "sin(x)", color: COLOR_PALETTE[0], visible: true, showTaylor: true },
+  ]);
+  const [focusedId, setFocusedId] = useState(1);
+  const inputRefs = useRef({});
+
+  const [center, setCenter] = useState(0);
+  const [terms,  setTerms]  = useState(8);
+  const [evalX,  setEvalX]  = useState(1.0);
+
+  const [showSyntax,         setShowSyntax]         = useState(false);
+  const [showKeyboard,       setShowKeyboard]       = useState(false);
+  const [showTaylorSettings, setShowTaylorSettings] = useState(true);
+  const [themeMode,          setThemeMode]          = useState("dark");
+  const [showDeriv,          setShowDeriv]          = useState(false);
+  const [showDeriv2,         setShowDeriv2]         = useState(false);
+  const [showInteg,          setShowInteg]          = useState(false);
+
+  const [odeMode,    setOdeMode]    = useState(false);
+  const [odeExpr,    setOdeExpr]    = useState("y");
+  const [odeX0,      setOdeX0]      = useState(0);
+  const [odeY0,      setOdeY0]      = useState(1);
+  const [odeVisible, setOdeVisible] = useState(true);
+
+  // Variable sliders: a-v (excluding x, y, z, w which stay as free variables)
+  const SLIDER_VARS = "a,b,c,d,f,g,h,k,m,n,p,q,r,s,t,u,v".split(",");
+  const [sliders, setSliders] = useState(() => {
+    const init = {};
+    SLIDER_VARS.forEach(v => { init[v] = { value: 1, min: -10, max: 10, active: false }; });
+    return init;
+  });
+  const [showSliders, setShowSliders] = useState(false);
+
+  const updateSlider = (v, updates) => {
+    setSliders(prev => ({ ...prev, [v]: { ...prev[v], ...updates } }));
+  };
+
+  // Build slider scope for expression evaluation
+  const sliderScope = useMemo(() => {
+    const scope = {};
+    SLIDER_VARS.forEach(v => { if (sliders[v].active) scope[v] = sliders[v].value; });
+    return scope;
+  }, [sliders]);
+
+  // OCR image upload state
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const handleImageUpload = async (file) => {
+    if (!file) return;
+    setOcrLoading(true);
+    try {
+      const result = await recognizeMathFromImage(file);
+      if (result.error) {
+        alert("OCR Error: " + result.error);
+      } else if (result.processed) {
+        if (focusedId) {
+          updateExpr(focusedId, { text: result.processed });
+        } else {
+          // Add new expression with OCR text directly via functional state update
+          setExpressions(prev => {
+            const id = nextExpressionId++;
+            const color = COLOR_PALETTE[(prev.length) % COLOR_PALETTE.length];
+            return [...prev, { id, text: result.processed, color, visible: true, showTaylor: true }];
+          });
+        }
+      }
+    } catch(e) {
+      alert("OCR failed: " + e.message);
+    }
+    setOcrLoading(false);
+  };
 
   const t = THEMES[themeMode];
 
-  // Parse + compile expression with mathjs
-  const { compiled, realFn, parseErr } = useMemo(() => {
-    try {
-      const c = math.compile(expr);
-      const rfn = x => {
-        try {
-          const v = c.evaluate({ x });
-          if (typeof v === "number") return v;
-          if (v?.re !== undefined)   return Math.abs(v.im ?? 0) < 1e-9 ? v.re : NaN;
-          return NaN;
-        } catch { return NaN; }
-      };
-      return { compiled: c, realFn: rfn, parseErr: null };
-    } catch (e) { return { compiled: null, realFn: null, parseErr: e.message }; }
-  }, [expr]);
+  const addExpression = () => {
+    const id = nextExpressionId++;
+    const colorIdx = expressions.length % COLOR_PALETTE.length;
+    setExpressions(prev => [...prev, {
+      id, text: "", color: COLOR_PALETTE[colorIdx], visible: true, showTaylor: true
+    }]);
+    setFocusedId(id);
+  };
 
-  // Compute Taylor coefficients — auto-retry with smaller radius on failure
-  const { coeffs, coeffErr } = useMemo(() => {
-    if (!compiled) return { coeffs: null, coeffErr: null };
-    for (const r of [0.5, 0.1, 0.02]) {
-      try {
-        const c = computeCoeffs(compiled, center, terms, r, 1024);
-        if (c && c.every(isFinite)) return { coeffs: c, coeffErr: null };
-      } catch { /* try smaller r */ }
+  const removeExpression = (id) => {
+    if (expressions.length <= 1) return;
+    setExpressions(prev => prev.filter(e => e.id !== id));
+  };
+
+  const updateExpr = (id, updates) => {
+    setExpressions(prev => prev.map(e => e.id === id ? { ...e, ...updates } : e));
+  };
+
+  const applyPreset = (text, c) => {
+    if (focusedId) updateExpr(focusedId, { text });
+    setCenter(c);
+  };
+
+  const handleKeyboardKey = (insert) => {
+    const el = inputRefs.current[focusedId];
+    if (!el) return;
+    const start = el.selectionStart || 0;
+    const end = el.selectionEnd || 0;
+    const currentExpr = expressions.find(e => e.id === focusedId);
+    if (!currentExpr) return;
+    const txt = currentExpr.text;
+    if (insert === "__BACKSPACE__") {
+      if (start > 0) {
+        const newText = txt.slice(0, start - 1) + txt.slice(end);
+        updateExpr(focusedId, { text: newText });
+        const pos = start - 1;
+        setTimeout(() => { if (el && el.parentNode) { try { el.focus(); el.setSelectionRange(pos, pos); } catch(e) {} } }, 0);
+      }
+      return;
     }
-    return { coeffs: null, coeffErr: "Could not compute — try a different center point" };
-  }, [compiled, center, terms]);
+    const newText = txt.slice(0, start) + insert + txt.slice(end);
+    updateExpr(focusedId, { text: newText });
+    const newPos = start + insert.length;
+    setTimeout(() => { if (el && el.parentNode) { try { el.focus(); el.setSelectionRange(newPos, newPos); } catch(e) {} } }, 0);
+  };
 
-  // Derivative / Integral / Second derivative coefficients (lazy — only when toggled on)
-  const dCoeffs  = useMemo(() => (showDeriv || showDeriv2) && coeffs ? derivCoeffs(coeffs) : null, [coeffs, showDeriv, showDeriv2]);
-  const d2Coeffs = useMemo(() => showDeriv2 && dCoeffs ? derivCoeffs(dCoeffs) : null, [dCoeffs, showDeriv2]);
-  const iCoeffs  = useMemo(() => showInteg && coeffs ? integCoeffs(coeffs) : null, [coeffs, showInteg]);
+  // Compile all expressions (with calculus engine + slider variables)
+  const exprData = useMemo(() => {
+    return expressions.map(expr => {
+      let compiled = null, realFn = null, parseErr = null;
+      let isPlainEq = false, plainResult = null;
+      let calculusResult = null;
+      if (expr.text.trim()) {
+        // First try calculus engine (diff, integrate, limit, sum, solve, etc.)
+        calculusResult = preprocessCalculus(expr.text);
+        if (calculusResult) {
+          isPlainEq = true;
+          plainResult = calculusResult;
+        } else {
+          try {
+            compiled = math.compile(expr.text);
+            // Check if expression uses variable x — if not, it's a plain equation
+            const usesX = /\bx\b/i.test(expr.text);
+            if (!usesX) {
+              try {
+                const v = compiled.evaluate({ ...sliderScope });
+                if (typeof v === "number" && isFinite(v)) {
+                  isPlainEq = true;
+                  plainResult = v;
+                } else if (v && v.re !== undefined) {
+                  isPlainEq = true;
+                  plainResult = Math.abs(v.im || 0) < 1e-9 ? v.re : v;
+                } else if (typeof v === "object" && v !== null) {
+                  isPlainEq = true;
+                  plainResult = v.toString();
+                }
+              } catch(e) {
+                // May still depend on x implicitly; treat as function
+              }
+            }
+            if (!isPlainEq) {
+              realFn = x => {
+                try {
+                  const v = compiled.evaluate({ x, ...sliderScope });
+                  if (typeof v === "number") return v;
+                  if (v && v.re !== undefined) return Math.abs(v.im || 0) < 1e-9 ? v.re : NaN;
+                  return NaN;
+                } catch(e) { return NaN; }
+              };
+            }
+          } catch(e) { parseErr = e.message; }
+        }
+      }
+      let coeffs = null, coeffErr = null;
+      if (compiled && !isPlainEq) {
+        // Adaptive DFT: use fewer samples for low term counts, more for high
+        const dftN = terms <= 30 ? 512 : terms <= 100 ? 1024 : 2048;
+        for (const r of [0.5, 0.1, 0.02]) {
+          try {
+            const c = computeCoeffs(compiled, center, terms, r, dftN, sliderScope);
+            if (c && c.every(isFinite)) { coeffs = c; break; }
+          } catch(e) { /* smaller radius reduces singularity influence, improving Cauchy integral stability */ }
+        }
+        if (!coeffs) coeffErr = "Could not compute \u2014 try a different center";
+      }
+      const dC = (showDeriv || showDeriv2) && coeffs ? derivCoeffs(coeffs) : null;
+      const d2C = showDeriv2 && dC ? derivCoeffs(dC) : null;
+      const iC = showInteg && coeffs ? integCoeffs(coeffs) : null;
+      return { ...expr, compiled, realFn, parseErr, coeffs, coeffErr,
+               dCoeffs: dC, d2Coeffs: d2C, iCoeffs: iC,
+               isPlainEq, plainResult, calculusResult };
+    });
+  }, [expressions, center, terms, showDeriv, showDeriv2, showInteg, sliderScope]);
 
-  // Numerical results at evalX
-  const { approx, exact, pctErr, derivVal, deriv2Val, integVal } = useMemo(() => {
-    if (!coeffs || !realFn) return {};
-    const approx = evalPoly(coeffs, center, evalX);
-    const exact  = realFn(evalX);
+  const firstData = exprData.find(e => e.visible && e.realFn && e.coeffs);
+
+  const evalResults = useMemo(() => {
+    if (!firstData) return {};
+    const approx = evalPoly(firstData.coeffs, center, evalX);
+    const exact = firstData.realFn(evalX);
     const pctErr = (isFinite(exact) && Math.abs(exact) > 1e-15)
       ? Math.abs((approx - exact) / exact) * 100 : NaN;
-    const derivVal  = dCoeffs  ? evalPoly(dCoeffs, center, evalX) : NaN;
-    const deriv2Val = d2Coeffs ? evalPoly(d2Coeffs, center, evalX) : NaN;
-    const integVal  = iCoeffs  ? evalPoly(iCoeffs, center, evalX) : NaN;
+    const derivVal = firstData.dCoeffs ? evalPoly(firstData.dCoeffs, center, evalX) : NaN;
+    const deriv2Val = firstData.d2Coeffs ? evalPoly(firstData.d2Coeffs, center, evalX) : NaN;
+    const integVal = firstData.iCoeffs ? evalPoly(firstData.iCoeffs, center, evalX) : NaN;
     return { approx, exact, pctErr, derivVal, deriv2Val, integVal };
-  }, [coeffs, realFn, center, evalX, dCoeffs, d2Coeffs, iCoeffs]);
+  }, [firstData, center, evalX]);
+
+  const { approx, exact, pctErr, derivVal, deriv2Val, integVal } = evalResults;
 
   const errColor = !isFinite(pctErr) ? t.textDim
     : pctErr < 0.001 ? t.successGreen
     : pctErr < 1     ? t.accent
-    :                  t.red;
+    :                   t.red;
+
+  const odeCurve = useMemo(() => {
+    if (!odeMode || !odeExpr.trim()) return [];
+    return solveODE_RK4(odeExpr, odeX0, odeY0, -15, 15, 0.02);
+  }, [odeMode, odeExpr, odeX0, odeY0]);
+
+  const displayCoeffs = firstData ? firstData.coeffs : null;
+  const focusedData = exprData.find(e => e.id === focusedId);
+
+  // Syntax reference data
+  const syntaxData = [
+    ["Arithmetic",  "+  \u2212  *  /  ^  **  %"],
+    ["Powers",      "x^2  x^(1/3)  2^x  e^(-x^2)"],
+    ["Trig",        "sin  cos  tan  sec  csc  cot"],
+    ["Inv trig",    "asin  acos  atan  atan2(y,x)"],
+    ["Hyperbolic",  "sinh  cosh  tanh  asinh  acosh  atanh"],
+    ["Exp / Log",   "exp(x)  ln(x)  log(x,b)  log2(x)  log10(x)"],
+    ["Roots",       "sqrt(x)  cbrt(x)  nthRoot(x,n)"],
+    ["Misc",        "abs  sign  floor  ceil  round  mod(a,b)  factorial(n)"],
+    ["Constants",   "pi  e  phi  tau  Infinity"],
+  ];
+  const syntaxExamples = [
+    "sin(x^2) * exp(-x/2)", "x^3 - 3*x + cos(pi*x)", "exp(-x^2) * cosh(x)",
+    "atan(x^2) / (1 + x^4)", "log(abs(x) + 1, 2)", "sqrt(4 - x^2)",
+    "factorial(floor(abs(x)))", "sin(x) / (1 + x^2)",
+  ];
 
   return (
     <div style={{ height: "100vh", background: t.bg, color: t.text,
@@ -395,275 +1239,503 @@ export default function TaylorApp() {
       <style>{`
         * { box-sizing: border-box; margin: 0; padding: 0; }
         input { background: ${t.inputBg}; border: 1px solid ${t.inputBorder}; color: ${t.text};
-          font-family: inherit; font-size: 0.88rem; padding: 0.42rem 0.65rem;
-          border-radius: 4px; outline: none; transition: border-color .15s; }
+          font-family: inherit; font-size: 0.88rem; font-weight: 600;
+          padding: 0.42rem 0.65rem; border-radius: 4px; outline: none;
+          transition: border-color .15s; }
         input:focus { border-color: ${t.accent2}; box-shadow: 0 0 0 2px rgba(78,205,196,.12); }
-        .lbl { font-size: 0.57rem; letter-spacing: .18em; text-transform: uppercase;
-          color: ${t.lblColor}; margin-bottom: .32rem; }
-        .tag { display:inline-block; padding:.16rem .48rem; background:${t.tagBg};
-          border:1px solid ${t.tagBorder}; border-radius:3px; font-size:.7rem; cursor:pointer;
-          color:${t.tagText}; transition:all .12s; }
-        .tag:hover { border-color:${t.accent2}; color:${t.accent2}; }
-        .tag.on  { border-color:${t.accent}; color:${t.accent}; background:rgba(246,201,14,.06); }
-        .vbox { background:${t.panel}; border:1px solid ${t.borderDim}; border-radius:5px; padding:.6rem .75rem; }
-        .big  { font-size:1.1rem; font-weight:700; }
-        hr    { border:none; border-top:1px solid ${t.borderPanel}; }
-        ::-webkit-scrollbar { width:3px; }
-        ::-webkit-scrollbar-thumb { background:${t.scrollThumb}; }
-        input[type=range] { padding:0; background:none; border:none; outline:none;
-          cursor:pointer; accent-color:${t.accent2}; }
-        .calc-toggle { display:inline-flex; align-items:center; gap:.3rem; padding:.2rem .5rem;
-          background:${t.panel}; border:1px solid ${t.borderDim}; border-radius:4px;
-          font-size:.68rem; cursor:pointer; color:${t.tagText}; transition:all .12s;
-          user-select:none; }
-        .calc-toggle:hover { border-color:${t.accent2}; }
-        .calc-toggle.on { border-color:${t.accent}; color:${t.accent}; }
-        .theme-btn { background:${t.panel}; border:1px solid ${t.border}; border-radius:6px;
-          padding:.3rem .6rem; cursor:pointer; font-size:.75rem; color:${t.text};
-          font-family:inherit; transition:all .15s; display:flex; align-items:center; gap:.3rem; }
-        .theme-btn:hover { border-color:${t.accent2}; color:${t.accent2}; }
+        ::-webkit-scrollbar { width: 3px; }
+        ::-webkit-scrollbar-thumb { background: ${t.scrollThumb}; }
+        input[type=range] { padding: 0; background: none; border: none; outline: none;
+          cursor: pointer; accent-color: ${t.accent2}; }
       `}</style>
 
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      {/* Header */}
       <div style={{ padding: ".5rem 1.1rem", borderBottom: `1px solid ${t.borderPanel}`,
         display: "flex", alignItems: "center", gap: "1rem", flexShrink: 0 }}>
         <div>
-          <div style={{ fontSize:".52rem", letterSpacing:".3em", color:t.headerSub, textTransform:"uppercase" }}>
-            Numerical Analysis
-          </div>
-          <div style={{ fontSize:"1.05rem", fontWeight:700, color:t.headerTitle, letterSpacing:".04em" }}>
-            <span style={{ color:t.accent }}>Taylor</span> Polynomial Calculator
+          <div style={{ fontSize: ".55rem", letterSpacing: ".3em", color: t.headerSub,
+            textTransform: "uppercase", fontWeight: 700 }}>Numerical Analysis</div>
+          <div style={{ fontSize: "1.1rem", fontWeight: 800, color: t.headerTitle, letterSpacing: ".04em" }}>
+            <span style={{ color: t.accent }}>Taylor</span> Polynomial Calculator
           </div>
         </div>
-        <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:".8rem" }}>
-          <div style={{ fontSize:".62rem", color:t.headerInfo, textAlign:"right" }}>
-            f(x) ≈ Σ cₙ·(x−a)ⁿ &nbsp;·&nbsp; Cauchy–DFT derivative method &nbsp;·&nbsp; up to 30 terms
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: ".8rem" }}>
+          <div style={{ fontSize: ".62rem", color: t.headerInfo, textAlign: "right", fontWeight: 600 }}>
+            f(x) {"\u2248"} {"\u03a3"} c{"\u2099"}{"\u00b7"}(x{"\u2212"}a){"\u207f"} {"\u00b7"} Cauchy{"\u2013"}DFT {"\u00b7"} up to 200 terms
           </div>
-          <button className="theme-btn"
+          <button style={{ background: t.panel, border: `1px solid ${t.border}`, borderRadius: "6px",
+            padding: ".3rem .6rem", cursor: "pointer", fontSize: ".75rem", color: t.text,
+            fontFamily: "inherit", fontWeight: 600, display: "flex", alignItems: "center", gap: ".3rem" }}
             onClick={() => setThemeMode(m => m === "dark" ? "light" : "dark")}>
-            {themeMode === "dark" ? "☀" : "🌙"} {themeMode === "dark" ? "Light" : "Dark"}
+            {themeMode === "dark" ? "\u2600 Light" : "\ud83c\udf19 Dark"}
           </button>
         </div>
       </div>
 
-      {/* ── Body: sidebar + graph ───────────────────────────────────────────── */}
-      <div style={{ flex:1, display:"grid", gridTemplateColumns:"290px 1fr", minHeight:0 }}>
+      {/* Body */}
+      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "320px 1fr", minHeight: 0 }}>
 
-        {/* ── Left sidebar ─────────────────────────────────────────────────── */}
-        <div style={{ borderRight:`1px solid ${t.borderPanel}`, padding:".75rem", overflowY:"auto",
-          display:"flex", flexDirection:"column", gap:".72rem" }}>
+        {/* LEFT SIDEBAR */}
+        <div style={{ borderRight: `1px solid ${t.borderPanel}`, background: t.sidebarBg,
+          display: "flex", flexDirection: "column", minHeight: 0 }}>
+          <div style={{ flex: 1, overflowY: "auto", padding: ".65rem" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: ".6rem" }}>
 
-          {/* Function input */}
-          <div>
-            <div className="lbl">Function f(x)</div>
-            <input value={expr} onChange={e => setExpr(e.target.value)}
-              style={{ width:"100%", fontSize:".95rem" }}
-              placeholder="sin(x^2) * exp(-x/3)" />
-            {parseErr && <div style={{ color:t.red, fontSize:".68rem", marginTop:".25rem" }}>⚠ {parseErr}</div>}
-            {coeffErr && <div style={{ color:t.errOrange, fontSize:".68rem", marginTop:".25rem" }}>⚠ {coeffErr}</div>}
-          </div>
-
-          {/* Presets */}
-          <div>
-            <div className="lbl">Presets</div>
-            <div style={{ display:"flex", flexWrap:"wrap", gap:".22rem" }}>
-              {PRESETS.map(([e, c]) => (
-                <span key={e} className={`tag ${expr === e ? "on" : ""}`}
-                  onClick={() => { setExpr(e); setCenter(c); }}>{e}</span>
-              ))}
-            </div>
-          </div>
-
-          <hr />
-
-          {/* Center a */}
-          <div>
-            <div className="lbl">Expansion center <span style={{ color:t.accent3 }}>a</span></div>
-            <input type="number" step="0.5" value={center}
-              onChange={e => setCenter(parseFloat(e.target.value) || 0)}
-              style={{ width:"100%" }} />
-          </div>
-
-          {/* Terms slider */}
-          <div>
-            <div className="lbl">
-              Number of terms &nbsp;
-              <span style={{ color:t.accent, letterSpacing:0 }}>N = {terms}</span>
-            </div>
-            <input type="range" min="1" max="30" value={terms}
-              onChange={e => setTerms(+e.target.value)}
-              style={{ width:"100%" }} />
-            <div style={{ display:"flex", justifyContent:"space-between",
-              fontSize:".55rem", color:t.textMuted, marginTop:".1rem" }}>
-              <span>1</span><span>10</span><span>20</span><span>30</span>
-            </div>
-          </div>
-
-          <hr />
-
-          {/* Evaluate at x */}
-          <div>
-            <div className="lbl">Evaluate at <span style={{ color:t.accent }}>x</span> =</div>
-            <input type="number" step="0.1" value={evalX}
-              onChange={e => setEvalX(parseFloat(e.target.value) || 0)}
-              style={{ width:"100%" }} />
-          </div>
-
-          {/* Results */}
-          {approx !== undefined && (
-            <div style={{ display:"flex", flexDirection:"column", gap:".35rem" }}>
-              <div className="vbox">
-                <div className="lbl" style={{ marginBottom:".12rem" }}>Taylor T({evalX})</div>
-                <div className="big" style={{ color:t.accent }}>
-                  {isFinite(approx) ? approx.toPrecision(9) : "—"}
+              {/* Expressions header */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ fontSize: ".75rem", fontWeight: 800, color: t.headerTitle,
+                  letterSpacing: ".08em", textTransform: "uppercase" }}>Expressions</div>
+                <div style={{ display: "flex", gap: ".3rem", alignItems: "center" }}>
+                  {/* OCR upload button */}
+                  <input type="file" accept="image/*" ref={fileInputRef}
+                    style={{ display: "none" }}
+                    onChange={e => { if (e.target.files[0]) handleImageUpload(e.target.files[0]); e.target.value = ""; }} />
+                  <button title="Upload image of equation (OCR)"
+                    onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                    style={{ background: "none", border: "none", cursor: "pointer",
+                      fontSize: ".8rem", fontWeight: 700, padding: ".1rem",
+                      color: ocrLoading ? t.accent : t.textDim, opacity: ocrLoading ? 0.5 : 1 }}>
+                    {ocrLoading ? "\u23f3" : "\ud83d\udcf7"}
+                  </button>
+                  <button title="Toggle keyboard"
+                    onClick={() => setShowKeyboard(s => !s)}
+                    style={{ background: "none", border: "none", cursor: "pointer",
+                      fontSize: ".85rem", fontWeight: 700,
+                      color: showKeyboard ? t.accent2 : t.textDim }}>{"\u2328"}</button>
                 </div>
               </div>
-              <div className="vbox">
-                <div className="lbl" style={{ marginBottom:".12rem" }}>Exact f({evalX})</div>
-                <div className="big" style={{ color:t.accent2 }}>
-                  {isFinite(exact) ? exact.toPrecision(9) : "—"}
-                </div>
-              </div>
-              <div className="vbox">
-                <div className="lbl" style={{ marginBottom:".12rem" }}>Percentage Error</div>
-                <div className="big" style={{ color: errColor }}>
-                  {!isFinite(pctErr) ? "—"
-                    : pctErr < 1e-10 ? "< 1×10⁻¹⁰ %"
-                    : pctErr.toPrecision(4) + " %"}
-                </div>
-              </div>
-            </div>
-          )}
 
-          <hr />
-
-          {/* ── Calculus Functions ──────────────────────────────────────────── */}
-          <div>
-            <div className="lbl">Calculus Functions</div>
-            <div style={{ display:"flex", flexWrap:"wrap", gap:".3rem", marginBottom:".4rem" }}>
-              <span className={`calc-toggle ${showDeriv ? "on" : ""}`}
-                onClick={() => setShowDeriv(s => !s)}>
-                <span style={{ color:t.derivColor }}>f′(x)</span> Derivative
-              </span>
-              <span className={`calc-toggle ${showDeriv2 ? "on" : ""}`}
-                onClick={() => setShowDeriv2(s => !s)}>
-                <span style={{ color:t.deriv2Color }}>f″(x)</span> 2nd Deriv
-              </span>
-              <span className={`calc-toggle ${showInteg ? "on" : ""}`}
-                onClick={() => setShowInteg(s => !s)}>
-                <span style={{ color:t.integColor }}>∫f dx</span> Integral
-              </span>
-            </div>
-
-            {/* Calculus values at evalX */}
-            {coeffs && (showDeriv || showDeriv2 || showInteg) && (
-              <div style={{ display:"flex", flexDirection:"column", gap:".3rem" }}>
-                {showDeriv && (
-                  <div className="vbox">
-                    <div className="lbl" style={{ marginBottom:".12rem" }}>
-                      f′({evalX}) <span style={{ textTransform:"none", letterSpacing:0 }}>— 1st derivative</span>
+              {/* Expression cards */}
+              {expressions.map((expr, idx) => {
+                const ed = exprData.find(e => e.id === expr.id);
+                const isPlain = ed && ed.isPlainEq;
+                const result = ed ? ed.plainResult : null;
+                const calcRes = ed ? ed.calculusResult : null;
+                return (
+                <div key={expr.id} style={{
+                  background: t.exprCardBg,
+                  border: `1px solid ${focusedId === expr.id ? t.accent2 : t.exprCardBorder}`,
+                  borderRadius: "8px", padding: ".5rem .6rem",
+                  borderLeft: `3px solid ${expr.color}`,
+                  boxShadow: focusedId === expr.id ? "0 0 0 2px rgba(78,205,196,.1)" : "none",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: ".4rem" }}>
+                    {/* Color picker — click the dot to change color */}
+                    <div style={{ position: "relative", flexShrink: 0 }}>
+                      <input type="color" value={expr.color}
+                        onChange={e => updateExpr(expr.id, { color: e.target.value })}
+                        style={{ position: "absolute", top: 0, left: 0, width: 18, height: 18,
+                          opacity: 0, cursor: "pointer" }} />
+                      <div style={{ width: 16, height: 16, borderRadius: "50%", background: expr.color,
+                        border: `2px solid ${t.exprCardBorder}`, cursor: "pointer" }} />
                     </div>
-                    <div className="big" style={{ color:t.derivColor }}>
-                      {isFinite(derivVal) ? derivVal.toPrecision(9) : "—"}
+                    <input
+                      ref={el => { if (el) inputRefs.current[expr.id] = el; }}
+                      value={expr.text}
+                      onChange={e => updateExpr(expr.id, { text: e.target.value })}
+                      onFocus={() => setFocusedId(expr.id)}
+                      placeholder="e.g. sin(x), solve(x^2-4), diff(x^3,x)"
+                      style={{ flex: 1, fontSize: ".88rem", fontWeight: 600, minWidth: 0,
+                        background: "transparent", border: "none", color: t.text,
+                        outline: "none", padding: ".25rem .3rem" }}
+                    />
+                    {/* Taylor toggle — only for graphable functions */}
+                    {!isPlain && ed && ed.realFn && (
+                    <button title={expr.showTaylor ? "Hide Taylor series" : "Show Taylor series"}
+                      onClick={() => updateExpr(expr.id, { showTaylor: !expr.showTaylor })}
+                      style={{ background: "none", border: "none", cursor: "pointer",
+                        color: expr.showTaylor ? t.accent2 : t.textMuted,
+                        fontSize: ".7rem", fontWeight: 800, padding: ".15rem",
+                        fontFamily: "inherit", opacity: expr.showTaylor ? 1 : 0.5 }}>
+                      T{"\u2099"}
+                    </button>
+                    )}
+                    {/* Visibility toggle */}
+                    <button title={expr.visible ? "Hide" : "Show"}
+                      onClick={() => updateExpr(expr.id, { visible: !expr.visible })}
+                      style={{ background: "none", border: "none", cursor: "pointer",
+                        color: expr.visible ? expr.color : t.textMuted, fontSize: ".75rem", padding: ".15rem" }}>
+                      {expr.visible ? "\ud83d\udc41" : "\ud83d\udc41\u200d\ud83d\udde8"}
+                    </button>
+                    {/* Remove */}
+                    {expressions.length > 1 && (
+                      <button title="Remove"
+                        onClick={() => removeExpression(expr.id)}
+                        style={{ background: "none", border: "none", cursor: "pointer",
+                          color: t.textMuted, fontSize: ".85rem", padding: ".15rem", fontFamily: "inherit" }}>
+                        {"\u00d7"}
+                      </button>
+                    )}
+                  </div>
+                  {/* Calculus engine result (diff, integrate, limit, sum, solve, etc.) */}
+                  {calcRes && (
+                    <div style={{ marginTop: ".35rem", paddingLeft: "1.6rem",
+                      fontSize: ".82rem", fontWeight: 700,
+                      color: calcRes.type === "error" ? t.red : t.accent2 }}>
+                      {calcRes.type === "error" ? ("\u26a0 " + calcRes.result)
+                       : calcRes.type === "symbolic" ? (calcRes.label + " = " + calcRes.result)
+                       : calcRes.type === "solve" ? calcRes.result
+                       : calcRes.type === "numeric"
+                         ? (calcRes.label + " = " + (typeof calcRes.result === "number"
+                             ? (Number.isInteger(calcRes.result) ? calcRes.result.toString()
+                               : calcRes.result.toPrecision(10).replace(/\.?0+$/, ""))
+                             : String(calcRes.result)))
+                       : String(calcRes.result)}
+                    </div>
+                  )}
+                  {/* Plain numeric result (when no calculus, just e.g. 2+2 = 4) */}
+                  {!calcRes && isPlain && result !== null && (
+                    <div style={{ marginTop: ".35rem", paddingLeft: "1.6rem",
+                      fontSize: ".82rem", fontWeight: 700, color: t.accent2 }}>
+                      {"= "}
+                      {typeof result === "number"
+                        ? (Number.isInteger(result) ? result.toString() : result.toPrecision(10).replace(/\.?0+$/, ""))
+                        : String(result)}
+                    </div>
+                  )}
+                </div>
+                );
+              })}
+
+              {/* Errors */}
+              {focusedData && focusedData.parseErr && (
+                <div style={{ color: t.red, fontSize: ".68rem", fontWeight: 600 }}>{"\u26a0"} {focusedData.parseErr}</div>
+              )}
+              {focusedData && focusedData.coeffErr && (
+                <div style={{ color: t.errOrange, fontSize: ".68rem", fontWeight: 600 }}>{"\u26a0"} {focusedData.coeffErr}</div>
+              )}
+
+              {/* Add button */}
+              <button onClick={addExpression}
+                style={{ width: "100%", background: t.panel, border: `1px dashed ${t.borderDim}`,
+                  borderRadius: "8px", padding: ".45rem", cursor: "pointer", color: t.textDim,
+                  fontSize: ".9rem", fontFamily: "inherit", fontWeight: 700 }}>
+                + Add Expression
+              </button>
+
+              {/* Virtual keyboard */}
+              {showKeyboard && <MathKeyboard theme={t} onKey={handleKeyboardKey} />}
+
+              {/* Variable Sliders */}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", cursor: "pointer",
+                  userSelect: "none", padding: ".35rem 0" }}
+                  onClick={() => setShowSliders(s => !s)}>
+                  <div style={{ fontSize: ".7rem", fontWeight: 800, color: t.headerTitle,
+                    letterSpacing: ".06em", textTransform: "uppercase" }}>
+                    {showSliders ? "\u25bc" : "\u25b6"} Variable Sliders
+                  </div>
+                </div>
+                {showSliders && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: ".4rem", paddingTop: ".2rem" }}>
+                    {SLIDER_VARS.map(v => (
+                      <div key={v} style={{ display: "flex", alignItems: "center", gap: ".4rem" }}>
+                        <button onClick={() => updateSlider(v, { active: !sliders[v].active })}
+                          style={{ width: 22, height: 22, borderRadius: "4px", cursor: "pointer",
+                            background: sliders[v].active ? t.accent2 : "transparent",
+                            border: `1.5px solid ${sliders[v].active ? t.accent2 : t.borderDim}`,
+                            color: "#fff", fontSize: ".6rem", fontWeight: 800, fontFamily: "inherit",
+                            display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          {sliders[v].active ? "\u2713" : ""}
+                        </button>
+                        <span style={{ fontSize: ".78rem", fontWeight: 700, color: t.accent3,
+                          minWidth: "1rem", textAlign: "center" }}>{v}</span>
+                        {sliders[v].active ? (
+                          <>
+                            <input type="range"
+                              min={sliders[v].min} max={sliders[v].max} step="0.01"
+                              value={sliders[v].value}
+                              onChange={e => updateSlider(v, { value: parseFloat(e.target.value) })}
+                              style={{ flex: 1, height: "4px" }} />
+                            <span style={{ fontSize: ".68rem", fontWeight: 600, color: t.text,
+                              minWidth: "2.5rem", textAlign: "right" }}>
+                              {sliders[v].value.toFixed(2)}
+                            </span>
+                          </>
+                        ) : (
+                          <span style={{ fontSize: ".62rem", color: t.textMuted, fontWeight: 600 }}>inactive</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Presets */}
+              <div>
+                <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                  color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>Presets</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: ".22rem" }}>
+                  {PRESETS.map(([pe, pc]) => {
+                    const focused = expressions.find(ex => ex.id === focusedId);
+                    const isOn = focused && focused.text === pe;
+                    return (
+                      <span key={pe} onClick={() => applyPreset(pe, pc)}
+                        style={{ display: "inline-block", padding: ".16rem .48rem", background: t.tagBg,
+                          border: `1px solid ${isOn ? t.accent : t.tagBorder}`, borderRadius: "3px",
+                          fontSize: ".7rem", cursor: "pointer", fontWeight: 600,
+                          color: isOn ? t.accent : t.tagText }}>
+                        {pe}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <hr style={{ border: "none", borderTop: `1px solid ${t.borderPanel}` }} />
+
+              {/* Taylor Settings (collapsible) */}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", cursor: "pointer",
+                  userSelect: "none", padding: ".35rem 0" }}
+                  onClick={() => setShowTaylorSettings(s => !s)}>
+                  <div style={{ fontSize: ".7rem", fontWeight: 800, color: t.headerTitle,
+                    letterSpacing: ".06em", textTransform: "uppercase" }}>
+                    {showTaylorSettings ? "\u25bc" : "\u25b6"} Taylor Settings
+                  </div>
+                </div>
+                {showTaylorSettings && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: ".6rem", paddingTop: ".3rem" }}>
+                    <div>
+                      <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                        color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>
+                        Expansion center <span style={{ color: t.accent3 }}>a</span>
+                      </div>
+                      <input type="number" step="0.5" value={center}
+                        onChange={e => setCenter(parseFloat(e.target.value) || 0)}
+                        style={{ width: "100%" }} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                        color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>
+                        Number of terms <span style={{ color: t.accent, letterSpacing: 0 }}>N = {terms}</span>
+                      </div>
+                      <input type="range" min="1" max="200" value={terms}
+                        onChange={e => setTerms(+e.target.value)} style={{ width: "100%" }} />
+                      <div style={{ display: "flex", justifyContent: "space-between",
+                        fontSize: ".55rem", color: t.textMuted, marginTop: ".1rem", fontWeight: 600 }}>
+                        <span>1</span><span>50</span><span>100</span><span>150</span><span>200</span>
+                      </div>
+                    </div>
+                    <hr style={{ border: "none", borderTop: `1px solid ${t.borderPanel}` }} />
+                    <div>
+                      <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                        color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>
+                        Evaluate at <span style={{ color: t.accent }}>x</span> =
+                      </div>
+                      <input type="number" step="0.1" value={evalX}
+                        onChange={e => setEvalX(parseFloat(e.target.value) || 0)}
+                        style={{ width: "100%" }} />
+                    </div>
+                    {/* Results */}
+                    {approx !== undefined && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: ".35rem" }}>
+                        <div style={{ background: t.panel, border: `1px solid ${t.borderDim}`, borderRadius: "5px",
+                          padding: ".6rem .75rem" }}>
+                          <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                            color: t.lblColor, marginBottom: ".12rem", fontWeight: 700 }}>Taylor T({evalX})</div>
+                          <div style={{ fontSize: "1.1rem", fontWeight: 700, color: t.accent }}>
+                            {isFinite(approx) ? approx.toPrecision(9) : "\u2014"}</div>
+                        </div>
+                        <div style={{ background: t.panel, border: `1px solid ${t.borderDim}`, borderRadius: "5px",
+                          padding: ".6rem .75rem" }}>
+                          <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                            color: t.lblColor, marginBottom: ".12rem", fontWeight: 700 }}>Exact f({evalX})</div>
+                          <div style={{ fontSize: "1.1rem", fontWeight: 700, color: t.accent2 }}>
+                            {isFinite(exact) ? exact.toPrecision(9) : "\u2014"}</div>
+                        </div>
+                        <div style={{ background: t.panel, border: `1px solid ${t.borderDim}`, borderRadius: "5px",
+                          padding: ".6rem .75rem" }}>
+                          <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                            color: t.lblColor, marginBottom: ".12rem", fontWeight: 700 }}>Percentage Error</div>
+                          <div style={{ fontSize: "1.1rem", fontWeight: 700, color: errColor }}>
+                            {!isFinite(pctErr) ? "\u2014"
+                              : pctErr < 1e-10 ? "< 1\u00d710\u207b\u00b9\u2070 %"
+                              : pctErr.toPrecision(4) + " %"}</div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <hr style={{ border: "none", borderTop: `1px solid ${t.borderPanel}` }} />
+
+              {/* Calculus Functions */}
+              <div>
+                <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                  color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>Calculus Functions</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: ".3rem", marginBottom: ".4rem" }}>
+                  <span onClick={() => setShowDeriv(s => !s)}
+                    style={{ display: "inline-flex", alignItems: "center", gap: ".3rem", padding: ".2rem .5rem",
+                      background: t.panel, border: `1px solid ${showDeriv ? t.accent : t.borderDim}`,
+                      borderRadius: "4px", fontSize: ".68rem", cursor: "pointer",
+                      color: showDeriv ? t.accent : t.tagText, fontWeight: 600, userSelect: "none" }}>
+                    <span style={{ color: t.derivColor }}>f{"\u2032"}(x)</span> Derivative
+                  </span>
+                  <span onClick={() => setShowDeriv2(s => !s)}
+                    style={{ display: "inline-flex", alignItems: "center", gap: ".3rem", padding: ".2rem .5rem",
+                      background: t.panel, border: `1px solid ${showDeriv2 ? t.accent : t.borderDim}`,
+                      borderRadius: "4px", fontSize: ".68rem", cursor: "pointer",
+                      color: showDeriv2 ? t.accent : t.tagText, fontWeight: 600, userSelect: "none" }}>
+                    <span style={{ color: t.deriv2Color }}>f{"\u2033"}(x)</span> 2nd Deriv
+                  </span>
+                  <span onClick={() => setShowInteg(s => !s)}
+                    style={{ display: "inline-flex", alignItems: "center", gap: ".3rem", padding: ".2rem .5rem",
+                      background: t.panel, border: `1px solid ${showInteg ? t.accent : t.borderDim}`,
+                      borderRadius: "4px", fontSize: ".68rem", cursor: "pointer",
+                      color: showInteg ? t.accent : t.tagText, fontWeight: 600, userSelect: "none" }}>
+                    <span style={{ color: t.integColor }}>{"\u222b"}f dx</span> Integral
+                  </span>
+                </div>
+                {/* Calculus values */}
+                {displayCoeffs && (showDeriv || showDeriv2 || showInteg) && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: ".3rem" }}>
+                    {showDeriv && (
+                      <div style={{ background: t.panel, border: `1px solid ${t.borderDim}`, borderRadius: "5px",
+                        padding: ".6rem .75rem" }}>
+                        <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                          color: t.lblColor, marginBottom: ".12rem", fontWeight: 700 }}>
+                          f{"\u2032"}({evalX}) {"\u2014"} 1st derivative</div>
+                        <div style={{ fontSize: "1.1rem", fontWeight: 700, color: t.derivColor }}>
+                          {isFinite(derivVal) ? derivVal.toPrecision(9) : "\u2014"}</div>
+                      </div>
+                    )}
+                    {showDeriv2 && (
+                      <div style={{ background: t.panel, border: `1px solid ${t.borderDim}`, borderRadius: "5px",
+                        padding: ".6rem .75rem" }}>
+                        <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                          color: t.lblColor, marginBottom: ".12rem", fontWeight: 700 }}>
+                          f{"\u2033"}({evalX}) {"\u2014"} 2nd derivative</div>
+                        <div style={{ fontSize: "1.1rem", fontWeight: 700, color: t.deriv2Color }}>
+                          {isFinite(deriv2Val) ? deriv2Val.toPrecision(9) : "\u2014"}</div>
+                      </div>
+                    )}
+                    {showInteg && (
+                      <div style={{ background: t.panel, border: `1px solid ${t.borderDim}`, borderRadius: "5px",
+                        padding: ".6rem .75rem" }}>
+                        <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                          color: t.lblColor, marginBottom: ".12rem", fontWeight: 700 }}>
+                          {"\u222b"}f dx at x={evalX} {"\u2014"} from a={center}</div>
+                        <div style={{ fontSize: "1.1rem", fontWeight: 700, color: t.integColor }}>
+                          {isFinite(integVal) ? integVal.toPrecision(9) : "\u2014"}</div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <hr style={{ border: "none", borderTop: `1px solid ${t.borderPanel}` }} />
+
+              {/* ODE Mode */}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+                  cursor: "pointer", userSelect: "none", padding: ".35rem 0" }}
+                  onClick={() => setOdeMode(s => !s)}>
+                  <div style={{ fontSize: ".7rem", fontWeight: 800, color: t.headerTitle,
+                    letterSpacing: ".06em", textTransform: "uppercase" }}>
+                    {odeMode ? "\u25bc" : "\u25b6"} ODE Mode
+                  </div>
+                  <div style={{ fontSize: ".58rem", color: t.odeColor, fontWeight: 700 }}>
+                    {odeMode ? "ON" : "OFF"}
+                  </div>
+                </div>
+                {odeMode && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: ".5rem", paddingTop: ".3rem" }}>
+                    <div>
+                      <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                        color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>
+                        dy/dx = f(x, y)
+                      </div>
+                      <input value={odeExpr} onChange={e => setOdeExpr(e.target.value)}
+                        placeholder="e.g. -y + sin(x)" style={{ width: "100%", fontSize: ".85rem" }} />
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: ".4rem" }}>
+                      <div>
+                        <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                          color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>x{"\u2080"}</div>
+                        <input type="number" step="0.5" value={odeX0}
+                          onChange={e => setOdeX0(parseFloat(e.target.value) || 0)}
+                          style={{ width: "100%" }} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                          color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>y(x{"\u2080"}) = y{"\u2080"}</div>
+                        <input type="number" step="0.5" value={odeY0}
+                          onChange={e => setOdeY0(parseFloat(e.target.value) || 0)}
+                          style={{ width: "100%" }} />
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: ".5rem" }}>
+                      <button onClick={() => setOdeVisible(s => !s)}
+                        style={{ background: "none", border: "none", cursor: "pointer",
+                          color: odeVisible ? t.odeColor : t.textMuted, fontSize: ".8rem", padding: ".15rem" }}>
+                        {odeVisible ? "\ud83d\udc41" : "\ud83d\udc41\u200d\ud83d\udde8"}
+                      </button>
+                      <span style={{ fontSize: ".65rem", fontWeight: 600, color: t.textDim }}>
+                        RK4 solution ({odeCurve.length} pts)
+                      </span>
                     </div>
                   </div>
                 )}
-                {showDeriv2 && (
-                  <div className="vbox">
-                    <div className="lbl" style={{ marginBottom:".12rem" }}>
-                      f″({evalX}) <span style={{ textTransform:"none", letterSpacing:0 }}>— 2nd derivative</span>
-                    </div>
-                    <div className="big" style={{ color:t.deriv2Color }}>
-                      {isFinite(deriv2Val) ? deriv2Val.toPrecision(9) : "—"}
-                    </div>
-                  </div>
-                )}
-                {showInteg && (
-                  <div className="vbox">
-                    <div className="lbl" style={{ marginBottom:".12rem" }}>
-                      ∫f dx at x={evalX} <span style={{ textTransform:"none", letterSpacing:0 }}>— from a={center}</span>
-                    </div>
-                    <div className="big" style={{ color:t.integColor }}>
-                      {isFinite(integVal) ? integVal.toPrecision(9) : "—"}
-                    </div>
+              </div>
+
+              <hr style={{ border: "none", borderTop: `1px solid ${t.borderPanel}` }} />
+
+              {/* Syntax Reference */}
+              <div>
+                <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                  color: t.lblColor, marginBottom: ".32rem", fontWeight: 700,
+                  cursor: "pointer", userSelect: "none" }}
+                  onClick={() => setShowSyntax(s => !s)}>
+                  {showSyntax ? "\u25bc" : "\u25b6"} Syntax Reference
+                </div>
+                {showSyntax && (
+                  <div style={{ fontSize: ".7rem", color: t.textDim, lineHeight: 2, marginTop: ".4rem", fontWeight: 600 }}>
+                    {syntaxData.map(([k, v]) => (
+                      <div key={k}>
+                        <span style={{ color: t.accent, fontWeight: 700 }}>{k}:</span> {v}
+                      </div>
+                    ))}
+                    <div style={{ marginTop: ".4rem", color: t.textMuted, fontWeight: 700 }}>Examples:</div>
+                    {syntaxExamples.map(ex => (
+                      <div key={ex} style={{ color: t.accent2, paddingLeft: ".5rem" }}>{"\u2192"} {ex}</div>
+                    ))}
                   </div>
                 )}
               </div>
-            )}
-          </div>
 
-          <hr />
-
-          {/* Syntax reference */}
-          <div>
-            <div className="lbl" style={{ cursor:"pointer", userSelect:"none" }}
-              onClick={() => setShowSyntax(s => !s)}>
-              {showSyntax ? "▼" : "▶"} &nbsp;Syntax Reference
             </div>
-            {showSyntax && (
-              <div style={{ fontSize:".7rem", color:t.textDim, lineHeight:2, marginTop:".4rem" }}>
-                {[
-                  ["Arithmetic",  "+  −  *  /  ^  **  %"],
-                  ["Powers",      "x^2  x^(1/3)  2^x  e^(-x^2)"],
-                  ["Trig",        "sin  cos  tan  sec  csc  cot"],
-                  ["Inv trig",    "asin  acos  atan  atan2(y,x)"],
-                  ["Hyperbolic",  "sinh  cosh  tanh  asinh  acosh  atanh"],
-                  ["Exp / Log",   "exp(x)  ln(x)  log(x,b)  log2(x)  log10(x)"],
-                  ["Roots",       "sqrt(x)  cbrt(x)  nthRoot(x,n)"],
-                  ["Misc",        "abs  sign  floor  ceil  round  mod(a,b)  factorial(n)"],
-                  ["Constants",   "pi  e  phi  tau  Infinity"],
-                ].map(([k, v]) => (
-                  <div key={k}>
-                    <span style={{ color:t.accent }}>{k}:</span> {v}
-                  </div>
-                ))}
-                <div style={{ marginTop:".4rem", color:t.textMuted }}>Examples:</div>
-                {["sin(x^2) * exp(-x/2)",
-                  "x^3 - 3*x + cos(pi*x)",
-                  "exp(-x^2) * cosh(x)",
-                  "atan(x^2) / (1 + x^4)",
-                  "log(abs(x) + 1, 2)",
-                  "sqrt(4 - x^2)",
-                  "factorial(floor(abs(x)))",
-                  "sin(x) / (1 + x^2)",
-                ].map(ex => (
-                  <div key={ex} style={{ color:t.accent2, paddingLeft:".5rem" }}>→ {ex}</div>
-                ))}
-              </div>
-            )}
           </div>
         </div>
 
-        {/* ── Right: graph + coeff strip ───────────────────────────────────── */}
-        <div style={{ display:"flex", flexDirection:"column", minHeight:0 }}>
-
-          {/* Canvas */}
-          <div style={{ flex:1, position:"relative", minHeight:0 }}>
-            <Graph realFn={realFn} coeffs={coeffs} center={center}
-                   evalX={evalX} numTerms={terms}
-                   dCoeffs={dCoeffs} iCoeffs={iCoeffs} d2Coeffs={d2Coeffs}
-                   showDeriv={showDeriv} showInteg={showInteg} showDeriv2={showDeriv2}
-                   theme={t} />
-            <div style={{ position:"absolute", top:8, right:10, fontSize:".58rem",
-              color:t.hintColor, textAlign:"right", pointerEvents:"none" }}>
-              scroll to zoom · drag to pan
+        {/* RIGHT: graph + coeff strip */}
+        <div style={{ display: "flex", flexDirection: "column", minHeight: 0 }}>
+          <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
+            <Graph exprData={exprData} center={center} evalX={evalX} numTerms={terms}
+              showDeriv={showDeriv} showInteg={showInteg} showDeriv2={showDeriv2}
+              odeCurve={odeCurve} odeVisible={odeMode && odeVisible}
+              theme={t} />
+            <div style={{ position: "absolute", top: 8, right: 10, fontSize: ".58rem",
+              color: t.hintColor, textAlign: "right", pointerEvents: "none", fontWeight: 600 }}>
+              scroll to zoom {"\u00b7"} drag to pan
             </div>
           </div>
-
           {/* Coefficient strip */}
-          {coeffs && (
-            <div style={{ borderTop:`1px solid ${t.borderPanel}`, padding:".45rem .8rem",
-              overflowX:"auto", flexShrink:0, maxHeight:"110px" }}>
-              <div className="lbl" style={{ marginBottom:".35rem" }}>
-                Coefficients &nbsp; cₙ = f⁽ⁿ⁾(a) / n!
+          {displayCoeffs && (
+            <div style={{ borderTop: `1px solid ${t.borderPanel}`, padding: ".45rem .8rem",
+              overflowX: "auto", flexShrink: 0, maxHeight: "110px" }}>
+              <div style={{ fontSize: ".6rem", letterSpacing: ".18em", textTransform: "uppercase",
+                color: t.lblColor, marginBottom: ".35rem", fontWeight: 700 }}>
+                Coefficients c{"\u2099"} = f{"\u207d\u207f\u207e"}(a) / n!
               </div>
-              <div style={{ display:"flex", gap:".28rem", flexWrap:"wrap" }}>
-                {coeffs.map((c, n) => (
-                  <div key={n} style={{ background:t.panel, border:`1px solid ${t.borderDim}`,
-                    borderRadius:"4px", padding:".22rem .5rem", fontSize:".68rem",
-                    whiteSpace:"nowrap" }}>
-                    <span style={{ color:t.accent3 }}>c{n}</span>
-                    <span style={{ color:t.borderDim }}>=</span>
+              <div style={{ display: "flex", gap: ".28rem", flexWrap: "wrap" }}>
+                {displayCoeffs.map((c, n) => (
+                  <div key={n} style={{ background: t.panel, border: `1px solid ${t.borderDim}`,
+                    borderRadius: "4px", padding: ".22rem .5rem", fontSize: ".68rem",
+                    whiteSpace: "nowrap", fontWeight: 600 }}>
+                    <span style={{ color: t.accent3 }}>c{n}</span>
+                    <span style={{ color: t.borderDim }}>=</span>
                     <span style={{ color: Math.abs(c) < 1e-12 ? t.dimCoeff : t.accent }}>
                       {Math.abs(c) < 1e-13 ? "0" : c.toPrecision(4)}
                     </span>
@@ -677,3 +1749,6 @@ export default function TaylorApp() {
     </div>
   );
 }
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<TaylorApp />);
