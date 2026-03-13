@@ -1055,16 +1055,12 @@ function TaylorApp() {
         if (focusedId) {
           updateExpr(focusedId, { text: result.processed });
         } else {
-          // Add new expression and insert OCR text safely
-          const newId = nextExpressionId; // peek at next ID before addExpression increments it
-          addExpression();
-          setTimeout(() => {
-            setExpressions(prev => {
-              const target = prev.find(e => e.id === newId) || prev[prev.length - 1];
-              if (!target) return prev;
-              return prev.map(e => e.id === target.id ? { ...e, text: result.processed } : e);
-            });
-          }, 50);
+          // Add new expression with OCR text directly via functional state update
+          setExpressions(prev => {
+            const id = nextExpressionId++;
+            const color = COLOR_PALETTE[(prev.length) % COLOR_PALETTE.length];
+            return [...prev, { id, text: result.processed, color, visible: true, showTaylor: true }];
+          });
         }
       }
     } catch(e) {
