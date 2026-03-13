@@ -1,37 +1,42 @@
-import { useState, useMemo, useRef, useEffect, useCallback } from "react";
-import * as math from "mathjs";
-
+const { useState, useMemo, useRef, useEffect, useCallback } = React;
 
 /* =========================================================================
    MATH UTILITIES
    ========================================================================= */
 
-function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024) {
+function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024, extraScope = {}) {
   const fRe = new Float64Array(N);
   const fIm = new Float64Array(N);
   const TWO_PI_OVER_N = (2 * Math.PI) / N;
+  // Pre-compute cos/sin table for DFT to avoid redundant trig calls
+  const cosTable = new Float64Array(N);
+  const sinTable = new Float64Array(N);
   for (let k = 0; k < N; k++) {
     const theta = TWO_PI_OVER_N * k;
-    const zRe = a + r * Math.cos(theta);
-    const zIm = r * Math.sin(theta);
+    cosTable[k] = Math.cos(theta);
+    sinTable[k] = Math.sin(theta);
+    const zRe = a + r * cosTable[k];
+    const zIm = r * sinTable[k];
     try {
-      const val = compiled.evaluate({ x: math.complex(zRe, zIm) });
+      const val = compiled.evaluate({ x: math.complex(zRe, zIm), ...extraScope });
       if (typeof val === "number")         { fRe[k] = val;    fIm[k] = 0; }
       else if (val != null && "re" in val) { fRe[k] = val.re; fIm[k] = val.im; }
       else                                 { fRe[k] = NaN;    fIm[k] = 0; }
-    } catch(e) { fRe[k] = NaN; fIm[k] = NaN; /* failed sample on circle — skipped via isFinite check in DFT */ }
+    } catch(e) { fRe[k] = NaN; fIm[k] = NaN; }
   }
-  const coeffs = [];
+  const coeffs = new Array(numTerms);
   let rPow = 1;
   for (let n = 0; n < numTerms; n++) {
     let re = 0;
-    const angleStep = -TWO_PI_OVER_N * n;
     for (let k = 0; k < N; k++) {
       if (!isFinite(fRe[k])) continue;
-      const angle = angleStep * k;
-      re += fRe[k] * Math.cos(angle) - fIm[k] * Math.sin(angle);
+      // angle = -TWO_PI_OVER_N * n * k — use trig identities with precomputed table
+      const nk = (n * k) % N;
+      const cosA = cosTable[nk];
+      const sinA = -sinTable[nk]; // negative angle
+      re += fRe[k] * cosA - fIm[k] * sinA;
     }
-    coeffs.push(re / (N * rPow));
+    coeffs[n] = re / (N * rPow);
     rPow *= r;
   }
   return coeffs;
@@ -113,6 +118,359 @@ function solveODE_RK4(fExpr, x0, y0, xMin, xMax, h = 0.01) {
 }
 
 /* =========================================================================
+   CALCULUS ENGINE — symbolic & numerical methods
+   Supports: derivatives, integrals, limits, sums, products, equation solving
+   ========================================================================= */
+
+// Adaptive Simpson's rule for numerical integration
+function adaptiveSimpson(f, a, b, tol, maxDepth) {
+  tol = tol || 1e-10;
+  maxDepth = maxDepth || 50;
+  function simpson(a, b) {
+    const c = (a + b) / 2;
+    return ((b - a) / 6) * (f(a) + 4 * f(c) + f(b));
+  }
+  function recurse(a, b, whole, depth) {
+    const c = (a + b) / 2;
+    const left = simpson(a, c);
+    const right = simpson(c, b);
+    if (depth >= maxDepth || Math.abs(left + right - whole) <= 15 * tol) {
+      return left + right + (left + right - whole) / 15;
+    }
+    return recurse(a, c, left, depth + 1) + recurse(c, b, right, depth + 1);
+  }
+  if (a === b) return 0;
+  if (a > b) return -adaptiveSimpson(f, b, a, tol, maxDepth);
+  return recurse(a, b, simpson(a, b), 0);
+}
+
+// Numerical limit via Richardson extrapolation
+function numericalLimit(f, target, side) {
+  // side: 0=both, 1=right, -1=left
+  side = side || 0;
+  function limitFromSide(dir) {
+    const hs = [];
+    const vals = [];
+    for (let k = 1; k <= 14; k++) {
+      const h = dir * Math.pow(0.1, k);
+      try {
+        const v = f(target + h);
+        if (!isFinite(v)) continue;
+        hs.push(Math.abs(h));
+        vals.push(v);
+      } catch(e) { continue; }
+    }
+    if (vals.length < 3) return NaN;
+    // Richardson extrapolation table
+    let table = vals.slice();
+    for (let j = 1; j < table.length; j++) {
+      const next = [];
+      for (let i = 0; i < table.length - j; i++) {
+        const r = hs[i] / hs[i + j];
+        next.push((r * table[i + 1] - table[i]) / (r - 1));
+      }
+      table = next;
+      if (table.length === 1) break;
+    }
+    return table[0];
+  }
+  if (side > 0) return limitFromSide(1);
+  if (side < 0) return limitFromSide(-1);
+  const left = limitFromSide(-1);
+  const right = limitFromSide(1);
+  if (!isFinite(left) && !isFinite(right)) return NaN;
+  if (!isFinite(left)) return right;
+  if (!isFinite(right)) return left;
+  if (Math.abs(left - right) < 1e-8 * (1 + Math.abs(left))) return (left + right) / 2;
+  return NaN; // limit doesn't exist (left ≠ right)
+}
+
+// Newton-Raphson equation solver: find roots of f(x) = 0
+function solveEquation(exprText) {
+  let lhs = exprText, rhs = "0";
+  if (exprText.includes("=")) {
+    const parts = exprText.split("=");
+    lhs = parts[0].trim();
+    rhs = parts[1].trim();
+  }
+  const diffExpr = "(" + lhs + ")-(" + rhs + ")";
+  let compiled;
+  try { compiled = math.compile(diffExpr); } catch(e) { return { err: e.message }; }
+  const f = x => { try { const v = compiled.evaluate({ x }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+
+  // Try symbolic derivative for Newton's method
+  let df;
+  try {
+    const dNode = math.derivative(diffExpr, "x");
+    const dCompiled = dNode.compile ? dNode.compile() : math.compile(dNode.toString());
+    df = x => { try { const v = dCompiled.evaluate({ x }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+  } catch(e) {
+    // Fallback: numerical derivative
+    df = x => (f(x + 1e-8) - f(x - 1e-8)) / 2e-8;
+  }
+
+  const roots = [];
+  const seen = new Set();
+  // Scan range [-20, 20] for sign changes and try Newton from multiple starting points
+  const starts = [];
+  for (let x = -20; x <= 20; x += 0.25) starts.push(x);
+  // Also add points where sign changes
+  let prevVal = f(-20);
+  for (let x = -19.9; x <= 20; x += 0.1) {
+    const val = f(x);
+    if (isFinite(prevVal) && isFinite(val) && prevVal * val < 0) {
+      // Bisection to narrow down
+      let lo = x - 0.1, hi = x;
+      for (let i = 0; i < 60; i++) {
+        const mid = (lo + hi) / 2;
+        const fm = f(mid);
+        if (!isFinite(fm)) break;
+        if (f(lo) * fm < 0) hi = mid; else lo = mid;
+      }
+      const root = (lo + hi) / 2;
+      const key = root.toFixed(8);
+      if (!seen.has(key) && Math.abs(f(root)) < 1e-6) {
+        seen.add(key);
+        roots.push(root);
+      }
+    }
+    prevVal = val;
+  }
+  // Newton-Raphson from various starting points
+  for (const x0 of starts) {
+    let x = x0;
+    for (let i = 0; i < 100; i++) {
+      const fx = f(x);
+      const dfx = df(x);
+      if (!isFinite(fx) || !isFinite(dfx) || Math.abs(dfx) < 1e-15) break;
+      const xNew = x - fx / dfx;
+      if (Math.abs(xNew - x) < 1e-12) { x = xNew; break; }
+      x = xNew;
+    }
+    if (isFinite(x) && Math.abs(f(x)) < 1e-8) {
+      const key = x.toFixed(8);
+      if (!seen.has(key)) { seen.add(key); roots.push(x); }
+    }
+  }
+  roots.sort((a, b) => a - b);
+  return { roots };
+}
+
+// Preprocess expression text to handle calculus syntax before math.compile
+// Supported: diff(...), integrate(...), limit(...), sum(...), prod(...), solve(...)
+function preprocessCalculus(text) {
+  const trimmed = text.trim();
+
+  // diff(expr, var) or diff(expr, var, n) — symbolic derivative
+  let m = trimmed.match(/^diff\((.+),\s*([a-z]),?\s*(\d+)?\)$/i);
+  if (m) {
+    try {
+      let node = math.parse(m[1]);
+      const v = m[2];
+      const n = parseInt(m[3] || "1");
+      for (let i = 0; i < n; i++) node = math.derivative(node, v);
+      const simplified = math.simplify(node);
+      return { type: "symbolic", label: n > 1 ? `d${n}/d${v}${n}` : `d/d${v}`, result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // d/dx(...) — symbolic derivative shorthand
+  m = trimmed.match(/^d\/d([a-z])\((.+)\)$/i);
+  if (m) {
+    try {
+      const node = math.derivative(m[2], m[1]);
+      const simplified = math.simplify(node);
+      return { type: "symbolic", label: `d/d${m[1]}`, result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // integrate(expr, var, a, b) — definite integral
+  m = trimmed.match(/^integrate\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (!m) m = trimmed.match(/^int\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const a = math.evaluate(m[3]);
+      const b = math.evaluate(m[4]);
+      const f = t => { try { const v = compiled.evaluate({ [vName]: t }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+      const result = adaptiveSimpson(f, a, b);
+      return { type: "numeric", label: `∫[${m[3]},${m[4]}]`, result };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // limit(expr, var, target) or limit(expr, var, target, side)
+  m = trimmed.match(/^limit\((.+),\s*([a-z]),\s*(.+?)(?:,\s*(left|right|[+-]?[01]))?\)$/i);
+  if (!m) m = trimmed.match(/^lim\((.+),\s*([a-z]),\s*(.+?)(?:,\s*(left|right|[+-]?[01]))?\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const target = math.evaluate(m[3]);
+      let side = 0;
+      if (m[4]) {
+        const s = m[4].toLowerCase();
+        if (s === "right" || s === "1" || s === "+1") side = 1;
+        else if (s === "left" || s === "-1") side = -1;
+      }
+      const f = t => { try { const v = compiled.evaluate({ [vName]: t }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+      const result = numericalLimit(f, target, side);
+      return { type: "numeric", label: `lim(${vName}→${m[3]})`, result };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // sum(expr, var, start, end) — summation
+  m = trimmed.match(/^sum\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const start = Math.round(math.evaluate(m[3]));
+      const end = Math.round(math.evaluate(m[4]));
+      if (Math.abs(end - start) > 1e7) return { type: "error", result: "Sum range too large (max 10M terms)" };
+      let total = 0;
+      for (let i = start; i <= end; i++) {
+        const v = compiled.evaluate({ [vName]: i });
+        if (typeof v === "number") total += v;
+        else return { type: "error", result: "Non-numeric term in sum" };
+      }
+      return { type: "numeric", label: `Σ(${vName}=${start}..${end})`, result: total };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // prod(expr, var, start, end) — product
+  m = trimmed.match(/^prod\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const start = Math.round(math.evaluate(m[3]));
+      const end = Math.round(math.evaluate(m[4]));
+      if (Math.abs(end - start) > 1e7) return { type: "error", result: "Product range too large (max 10M terms)" };
+      let total = 1;
+      for (let i = start; i <= end; i++) {
+        const v = compiled.evaluate({ [vName]: i });
+        if (typeof v === "number") total *= v;
+        else return { type: "error", result: "Non-numeric term in product" };
+      }
+      return { type: "numeric", label: `Π(${vName}=${start}..${end})`, result: total };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // solve(expr) or solve(lhs = rhs) — find real roots
+  m = trimmed.match(/^solve\((.+)\)$/i);
+  if (m) {
+    const result = solveEquation(m[1]);
+    if (result.err) return { type: "error", result: result.err };
+    if (result.roots.length === 0) return { type: "solve", label: "solve", roots: [], result: "No real solutions found" };
+    return { type: "solve", label: "solve", roots: result.roots,
+      result: "x = " + result.roots.map(r => {
+        if (Math.abs(r) < 1e-12) return "0";
+        if (Number.isInteger(r)) return r.toString();
+        return r.toPrecision(10).replace(/\.?0+$/, "");
+      }).join(", ") };
+  }
+
+  // simplify(expr) — symbolic simplification
+  m = trimmed.match(/^simplify\((.+)\)$/i);
+  if (m) {
+    try {
+      const simplified = math.simplify(m[1]);
+      return { type: "symbolic", label: "simplify", result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // expand(expr) — symbolic expansion via rationalize
+  m = trimmed.match(/^expand\((.+)\)$/i);
+  if (m) {
+    try {
+      const expanded = math.rationalize(m[1]);
+      return { type: "symbolic", label: "expand", result: expanded.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // Equation with = sign (not inside a function call) — auto-solve
+  if (trimmed.includes("=") && !trimmed.match(/^(diff|integrate|int|limit|lim|sum|prod|solve|simplify|expand)\(/i)) {
+    const result = solveEquation(trimmed);
+    if (result.err) return null; // fall through to normal evaluation
+    if (result.roots.length > 0) {
+      return { type: "solve", label: "solve", roots: result.roots,
+        result: "x = " + result.roots.map(r => {
+          if (Math.abs(r) < 1e-12) return "0";
+          if (Number.isInteger(r)) return r.toString();
+          return r.toPrecision(10).replace(/\.?0+$/, "");
+        }).join(", ") };
+    }
+  }
+
+  return null; // not a calculus expression — use normal evaluation
+}
+
+/* =========================================================================
+   MATH OCR — recognize math from uploaded images
+   Uses Tesseract.js for OCR + post-processing for math syntax
+   ========================================================================= */
+
+function postProcessMathOCR(raw) {
+  let t = raw.trim();
+  // Normalize common OCR misreads and Unicode symbols
+  t = t.replace(/\u00d7/g, "*");      // ×
+  t = t.replace(/\u00f7/g, "/");      // ÷
+  t = t.replace(/\u2212/g, "-");      // −
+  t = t.replace(/\u2013/g, "-");      // –
+  t = t.replace(/\u2014/g, "-");      // —
+  t = t.replace(/\u00b2/g, "^2");     // ²
+  t = t.replace(/\u00b3/g, "^3");     // ³
+  t = t.replace(/\u221a/g, "sqrt");   // √
+  t = t.replace(/\u03c0/g, "pi");     // π
+  t = t.replace(/\u03b8/g, "x");      // θ → x
+  t = t.replace(/\u222b/g, "integrate"); // ∫
+  t = t.replace(/\u03a3/g, "sum");    // Σ
+  t = t.replace(/\u03a0/g, "prod");   // Π
+  t = t.replace(/\u221e/g, "Infinity"); // ∞
+  // Common OCR misreads
+  t = t.replace(/\bl\b(?=n\s*\()/g, "l");  // keep ln
+  t = t.replace(/\bIn\b/g, "ln");     // In → ln
+  t = t.replace(/\bIog\b/gi, "log");  // Iog → log
+  t = t.replace(/\bSin\b/g, "sin");
+  t = t.replace(/\bCos\b/g, "cos");
+  t = t.replace(/\bTan\b/g, "tan");
+  t = t.replace(/[{}[\]]/g, c => c === "{" || c === "[" ? "(" : ")");
+  // Remove stray characters
+  t = t.replace(/[|\\]/g, "");
+  // Collapse whitespace
+  t = t.replace(/\s+/g, " ").trim();
+  // Implicit multiplication: 2x → 2*x, )x → )*x, )( → )*(
+  t = t.replace(/(\d)([a-zA-Z(])/g, "$1*$2");
+  t = t.replace(/\)(\()/g, ")*(");
+  t = t.replace(/\)([a-zA-Z])/g, ")*$1");
+  return t;
+}
+
+async function recognizeMathFromImage(imageFile) {
+  if (typeof Tesseract === "undefined") {
+    return { error: "Tesseract.js not loaded" };
+  }
+  try {
+    const worker = await Tesseract.createWorker("eng", 1, {
+      corePath: "https://unpkg.com/tesseract.js-core@5.1.0/tesseract-core-simd-lstm.wasm.js",
+      workerPath: "https://unpkg.com/tesseract.js@5.1.1/dist/worker.min.js",
+    });
+    await worker.setParameters({
+      tessedit_char_whitelist: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-*/^().,=<>! ",
+      tessedit_pageseg_mode: "7",
+    });
+    const { data } = await worker.recognize(imageFile);
+    await worker.terminate();
+    const raw = data.text || "";
+    const processed = postProcessMathOCR(raw);
+    return { raw, processed };
+  } catch(e) {
+    return { error: e.message || "OCR failed" };
+  }
+}
+
+/* =========================================================================
    THEMES
    ========================================================================= */
 
@@ -172,42 +530,175 @@ const PRESETS = [
    VIRTUAL MATH KEYBOARD
    ========================================================================= */
 
-const KB_ROWS = [
+/* =========================================================================
+   DESMOS-STYLE KEYBOARD — all sections
+   Tabs: 123, functions, ABC, αβγ (Greek), misc
+   ========================================================================= */
+
+const KB_123 = [
+  [
+    { label: "\u00b9\u2044\u2093", insert: "/" },
+    { label: "x\u00b2", insert: "^2" },
+    { label: "x\u02b8", insert: "^" },
+    { label: "\u221a", insert: "sqrt(" },
+    { label: "\u221b", insert: "cbrt(" },
+    { label: "\u207f\u221a", insert: "nthRoot(" },
+  ],
   [
     { label: "7", insert: "7" }, { label: "8", insert: "8" }, { label: "9", insert: "9" },
-    { label: "\u00f7", insert: "/" }, { label: "sin", insert: "sin(" }, { label: "cos", insert: "cos(" },
-    { label: "tan", insert: "tan(" }, { label: "\u03c0", insert: "pi" },
+    { label: "\u00f7", insert: "/" }, { label: "(", insert: "(" }, { label: ")", insert: ")" },
   ],
   [
     { label: "4", insert: "4" }, { label: "5", insert: "5" }, { label: "6", insert: "6" },
-    { label: "\u00d7", insert: "*" }, { label: "exp", insert: "exp(" }, { label: "ln", insert: "ln(" },
-    { label: "sqrt", insert: "sqrt(" }, { label: "e", insert: "e" },
+    { label: "\u00d7", insert: "*" }, { label: "|a|", insert: "abs(" }, { label: "\u03c0", insert: "pi" },
   ],
   [
     { label: "1", insert: "1" }, { label: "2", insert: "2" }, { label: "3", insert: "3" },
-    { label: "\u2212", insert: "-" }, { label: "abs", insert: "abs(" }, { label: "^", insert: "^" },
-    { label: "(", insert: "(" }, { label: ")", insert: ")" },
+    { label: "\u2212", insert: "-" }, { label: ",", insert: ", " }, { label: "e", insert: "e" },
   ],
   [
-    { label: "0", insert: "0" }, { label: ".", insert: "." }, { label: "x", insert: "x" },
-    { label: "+", insert: "+" }, { label: "asin", insert: "asin(" }, { label: "acos", insert: "acos(" },
-    { label: "atan", insert: "atan(" }, { label: "\u232b", insert: "__BACKSPACE__" },
+    { label: "0", insert: "0" }, { label: ".", insert: "." }, { label: "=", insert: "=" },
+    { label: "+", insert: "+" }, { label: "x", insert: "x" }, { label: "\u232b", insert: "__BACKSPACE__" },
   ],
 ];
 
-function MathKeyboard({ theme: t, onKey }) {
+const KB_FUNC = [
+  [
+    { label: "sin", insert: "sin(" }, { label: "cos", insert: "cos(" },
+    { label: "tan", insert: "tan(" }, { label: "csc", insert: "csc(" },
+    { label: "sec", insert: "sec(" }, { label: "cot", insert: "cot(" },
+  ],
+  [
+    { label: "sin\u207b\u00b9", insert: "asin(" }, { label: "cos\u207b\u00b9", insert: "acos(" },
+    { label: "tan\u207b\u00b9", insert: "atan(" }, { label: "csc\u207b\u00b9", insert: "acsc(" },
+    { label: "sec\u207b\u00b9", insert: "asec(" }, { label: "cot\u207b\u00b9", insert: "acot(" },
+  ],
+  [
+    { label: "sinh", insert: "sinh(" }, { label: "cosh", insert: "cosh(" },
+    { label: "tanh", insert: "tanh(" }, { label: "csch", insert: "csch(" },
+    { label: "sech", insert: "sech(" }, { label: "coth", insert: "coth(" },
+  ],
+  [
+    { label: "ln", insert: "ln(" }, { label: "log", insert: "log(" },
+    { label: "exp", insert: "exp(" }, { label: "n!", insert: "factorial(" },
+    { label: "nCr", insert: "combinations(" }, { label: "nPr", insert: "permutations(" },
+  ],
+  [
+    { label: "floor", insert: "floor(" }, { label: "ceil", insert: "ceil(" },
+    { label: "round", insert: "round(" }, { label: "sign", insert: "sign(" },
+    { label: "min", insert: "min(" }, { label: "max", insert: "max(" },
+  ],
+  [
+    { label: "mod", insert: "mod(" }, { label: "gcd", insert: "gcd(" },
+    { label: "lcm", insert: "lcm(" }, { label: "rand", insert: "random()" },
+    { label: "(", insert: "(" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_ABC = [
+  [
+    { label: "a", insert: "a" }, { label: "b", insert: "b" }, { label: "c", insert: "c" },
+    { label: "d", insert: "d" }, { label: "e", insert: "e" }, { label: "f", insert: "f" },
+    { label: "g", insert: "g" },
+  ],
+  [
+    { label: "h", insert: "h" }, { label: "i", insert: "i" }, { label: "j", insert: "j" },
+    { label: "k", insert: "k" }, { label: "l", insert: "l" }, { label: "m", insert: "m" },
+    { label: "n", insert: "n" },
+  ],
+  [
+    { label: "o", insert: "o" }, { label: "p", insert: "p" }, { label: "q", insert: "q" },
+    { label: "r", insert: "r" }, { label: "s", insert: "s" }, { label: "t", insert: "t" },
+    { label: "u", insert: "u" },
+  ],
+  [
+    { label: "v", insert: "v" }, { label: "w", insert: "w" }, { label: "x", insert: "x" },
+    { label: "y", insert: "y" }, { label: "z", insert: "z" }, { label: "_", insert: "_" },
+    { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_GREEK = [
+  [
+    { label: "\u03b1", insert: "alpha" }, { label: "\u03b2", insert: "beta" },
+    { label: "\u03b3", insert: "gamma" }, { label: "\u03b4", insert: "delta" },
+    { label: "\u03b5", insert: "epsilon" }, { label: "\u03b6", insert: "zeta" },
+  ],
+  [
+    { label: "\u03b7", insert: "eta" }, { label: "\u03b8", insert: "theta" },
+    { label: "\u03b9", insert: "iota" }, { label: "\u03ba", insert: "kappa" },
+    { label: "\u03bb", insert: "lambda" }, { label: "\u03bc", insert: "mu" },
+  ],
+  [
+    { label: "\u03bd", insert: "nu" }, { label: "\u03be", insert: "xi" },
+    { label: "\u03c0", insert: "pi" }, { label: "\u03c1", insert: "rho" },
+    { label: "\u03c3", insert: "sigma" }, { label: "\u03c4", insert: "tau" },
+  ],
+  [
+    { label: "\u03c5", insert: "upsilon" }, { label: "\u03c6", insert: "phi" },
+    { label: "\u03c7", insert: "chi" }, { label: "\u03c8", insert: "psi" },
+    { label: "\u03c9", insert: "omega" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_MISC = [
+  [
+    { label: "\u2264", insert: "<=" }, { label: "\u2265", insert: ">=" },
+    { label: "<", insert: "<" }, { label: ">", insert: ">" },
+    { label: "\u2260", insert: "!=" }, { label: "=", insert: "=" },
+  ],
+  [
+    { label: "d/dx", insert: "d/dx(" }, { label: "\u222b", insert: "integrate(" },
+    { label: "lim", insert: "limit(" }, { label: "\u03a3", insert: "sum(" },
+    { label: "\u03a0", insert: "prod(" }, { label: "solve", insert: "solve(" },
+  ],
+  [
+    { label: "diff", insert: "diff(" }, { label: "simpl", insert: "simplify(" },
+    { label: "expand", insert: "expand(" }, { label: "\u221e", insert: "Infinity" },
+    { label: "true", insert: "true" }, { label: "false", insert: "false" },
+  ],
+  [
+    { label: "[", insert: "[" }, { label: "]", insert: "]" },
+    { label: "{", insert: "{" }, { label: "}", insert: "}" },
+    { label: ";", insert: ";" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_TABS = [
+  { key: "123", label: "123", rows: KB_123, cols: 6 },
+  { key: "func", label: "f(x)", rows: KB_FUNC, cols: 6 },
+  { key: "abc", label: "ABC", rows: KB_ABC, cols: 7 },
+  { key: "greek", label: "\u03b1\u03b2\u03b3", rows: KB_GREEK, cols: 6 },
+  { key: "misc", label: "\u2234", rows: KB_MISC, cols: 6 },
+];
+
+const MathKeyboard = React.memo(function MathKeyboard({ theme: t, onKey }) {
+  const [tab, setTab] = React.useState("123");
+  const active = KB_TABS.find(tb => tb.key === tab) || KB_TABS[0];
   return (
     <div style={{ background: t.kbBg, border: `1px solid ${t.borderDim}`, padding: ".4rem",
       display: "flex", flexDirection: "column", gap: ".3rem", borderRadius: "8px" }}>
-      {KB_ROWS.map((row, ri) => (
-        <div key={ri} style={{ display: "grid", gridTemplateColumns: "repeat(8, 1fr)", gap: ".25rem" }}>
+      <div style={{ display: "flex", gap: ".2rem", marginBottom: ".1rem" }}>
+        {KB_TABS.map(tb => (
+          <button key={tb.key} onClick={() => setTab(tb.key)}
+            style={{ flex: 1, background: tab === tb.key ? t.accent2 : t.kbBtnBg,
+              border: `1px solid ${tab === tb.key ? t.accent2 : t.kbBtnBorder}`, borderRadius: "5px",
+              padding: ".22rem .1rem", cursor: "pointer",
+              color: tab === tb.key ? "#fff" : t.text,
+              fontFamily: "inherit", fontSize: ".6rem", fontWeight: 700 }}>
+            {tb.label}
+          </button>
+        ))}
+      </div>
+      {active.rows.map((row, ri) => (
+        <div key={ri} style={{ display: "grid", gridTemplateColumns: `repeat(${active.cols}, 1fr)`, gap: ".22rem" }}>
           {row.map((btn, bi) => (
             <button key={bi}
               onMouseDown={e => { e.preventDefault(); onKey(btn.insert); }}
               style={{
                 background: t.kbBtnBg, border: `1px solid ${t.kbBtnBorder}`,
-                borderRadius: "6px", padding: ".35rem .1rem", cursor: "pointer",
-                color: t.text, fontFamily: "inherit", fontSize: ".72rem", fontWeight: 600,
+                borderRadius: "6px", padding: ".36rem .08rem", cursor: "pointer",
+                color: t.text, fontFamily: "inherit", fontSize: ".68rem", fontWeight: 600,
               }}
               onMouseEnter={e => { e.currentTarget.style.background = t.kbBtnHover; }}
               onMouseLeave={e => { e.currentTarget.style.background = t.kbBtnBg; }}
@@ -217,13 +708,13 @@ function MathKeyboard({ theme: t, onKey }) {
       ))}
     </div>
   );
-}
+});  // React.memo(MathKeyboard)
 
 /* =========================================================================
-   GRAPH COMPONENT (multi-function + ODE)
+   GRAPH COMPONENT (multi-function + ODE) — wrapped in React.memo
    ========================================================================= */
 
-function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDeriv2,
+const Graph = React.memo(function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDeriv2,
                   odeCurve, odeVisible, theme }) {
   const canvasRef = useRef(null);
   const viewRef   = useRef({ cx: 0, cy: 0, scale: 80 });
@@ -417,7 +908,7 @@ function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDe
     const f = e.deltaY < 0 ? 1.2 : 0.833;
     const wMx = (mx - W/2) / scale + cx;
     const wMy = (H/2 - my) / scale + cy;
-    const ns = Math.max(4, Math.min(2e5, scale * f));
+    const ns = Math.max(1e-12, Math.min(1e12, scale * f));
     viewRef.current = { cx: wMx - (mx - W/2)/ns, cy: wMy + (my - H/2)/ns, scale: ns };
     schedRedraw();
   }, [schedRedraw]);
@@ -429,23 +920,44 @@ function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDe
     return () => cv.removeEventListener("wheel", onWheel);
   }, [onWheel]);
 
-  const onDown = e => { dragRef.current = { x: e.clientX, y: e.clientY, ...viewRef.current }; };
-  const onMove = e => {
+  const onDown = useCallback(e => { dragRef.current = { x: e.clientX, y: e.clientY, ...viewRef.current }; }, []);
+  const onMove = useCallback(e => {
     if (!dragRef.current) return;
     const { x, y, cx, cy, scale } = dragRef.current;
     viewRef.current.cx = cx - (e.clientX - x) / scale;
     viewRef.current.cy = cy + (e.clientY - y) / scale;
     schedRedraw();
-  };
-  const onUp = () => { dragRef.current = null; };
+  }, [schedRedraw]);
+  const onUp = useCallback(() => { dragRef.current = null; }, []);
+
+  const canvasStyle = useMemo(() => ({ display: "block", width: "100%", height: "100%", cursor: "crosshair", touchAction: "none" }), []);
+
+  // Touch support for mobile
+  const onTouchStart = useCallback(e => {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      dragRef.current = { x: t.clientX, y: t.clientY, ...viewRef.current };
+    }
+  }, []);
+  const onTouchMove = useCallback(e => {
+    e.preventDefault();
+    if (!dragRef.current || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const { x, y, cx, cy, scale } = dragRef.current;
+    viewRef.current.cx = cx - (t.clientX - x) / scale;
+    viewRef.current.cy = cy + (t.clientY - y) / scale;
+    schedRedraw();
+  }, [schedRedraw]);
+  const onTouchEnd = useCallback(() => { dragRef.current = null; }, []);
 
   return (
     <canvas ref={canvasRef}
-      style={{ display: "block", width: "100%", height: "100%", cursor: "crosshair" }}
+      style={canvasStyle}
       onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+      onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
     />
   );
-}
+});  // React.memo(Graph)
 
 /* =========================================================================
    MAIN APP
@@ -477,6 +989,56 @@ function TaylorApp() {
   const [odeX0,      setOdeX0]      = useState(0);
   const [odeY0,      setOdeY0]      = useState(1);
   const [odeVisible, setOdeVisible] = useState(true);
+
+  // Variable sliders: a-v (excluding x, y, z, w which stay as free variables)
+  const SLIDER_VARS = "a,b,c,d,f,g,h,k,m,n,p,q,r,s,t,u,v".split(",");
+  const [sliders, setSliders] = useState(() => {
+    const init = {};
+    SLIDER_VARS.forEach(v => { init[v] = { value: 1, min: -10, max: 10, active: false }; });
+    return init;
+  });
+  const [showSliders, setShowSliders] = useState(false);
+
+  const updateSlider = (v, updates) => {
+    setSliders(prev => ({ ...prev, [v]: { ...prev[v], ...updates } }));
+  };
+
+  // Build slider scope for expression evaluation
+  const sliderScope = useMemo(() => {
+    const scope = {};
+    SLIDER_VARS.forEach(v => { if (sliders[v].active) scope[v] = sliders[v].value; });
+    return scope;
+  }, [sliders]);
+
+  // OCR image upload state
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const handleImageUpload = async (file) => {
+    if (!file) return;
+    setOcrLoading(true);
+    try {
+      const result = await recognizeMathFromImage(file);
+      if (result.error) {
+        alert("OCR Error: " + result.error);
+      } else if (result.processed) {
+        if (focusedId) {
+          updateExpr(focusedId, { text: result.processed });
+        } else {
+          addExpression();
+          setTimeout(() => {
+            setExpressions(prev => {
+              const last = prev[prev.length - 1];
+              return prev.map(e => e.id === last.id ? { ...e, text: result.processed } : e);
+            });
+          }, 50);
+        }
+      }
+    } catch(e) {
+      alert("OCR failed: " + e.message);
+    }
+    setOcrLoading(false);
+  };
 
   const t = THEMES[themeMode];
 
@@ -525,28 +1087,60 @@ function TaylorApp() {
     setTimeout(() => { el.focus(); el.setSelectionRange(newPos, newPos); }, 0);
   };
 
-  // Compile all expressions
+  // Compile all expressions (with calculus engine + slider variables)
   const exprData = useMemo(() => {
     return expressions.map(expr => {
       let compiled = null, realFn = null, parseErr = null;
+      let isPlainEq = false, plainResult = null;
+      let calculusResult = null;
       if (expr.text.trim()) {
-        try {
-          compiled = math.compile(expr.text);
-          realFn = x => {
-            try {
-              const v = compiled.evaluate({ x });
-              if (typeof v === "number") return v;
-              if (v && v.re !== undefined) return Math.abs(v.im || 0) < 1e-9 ? v.re : NaN;
-              return NaN;
-            } catch(e) { return NaN; }
-          };
-        } catch(e) { parseErr = e.message; }
+        // First try calculus engine (diff, integrate, limit, sum, solve, etc.)
+        calculusResult = preprocessCalculus(expr.text);
+        if (calculusResult) {
+          isPlainEq = true;
+          plainResult = calculusResult;
+        } else {
+          try {
+            compiled = math.compile(expr.text);
+            // Check if expression uses variable x — if not, it's a plain equation
+            const usesX = /\bx\b/i.test(expr.text);
+            if (!usesX) {
+              try {
+                const v = compiled.evaluate({ ...sliderScope });
+                if (typeof v === "number" && isFinite(v)) {
+                  isPlainEq = true;
+                  plainResult = v;
+                } else if (v && v.re !== undefined) {
+                  isPlainEq = true;
+                  plainResult = Math.abs(v.im || 0) < 1e-9 ? v.re : v;
+                } else if (typeof v === "object" && v !== null) {
+                  isPlainEq = true;
+                  plainResult = v.toString();
+                }
+              } catch(e) {
+                // May still depend on x implicitly; treat as function
+              }
+            }
+            if (!isPlainEq) {
+              realFn = x => {
+                try {
+                  const v = compiled.evaluate({ x, ...sliderScope });
+                  if (typeof v === "number") return v;
+                  if (v && v.re !== undefined) return Math.abs(v.im || 0) < 1e-9 ? v.re : NaN;
+                  return NaN;
+                } catch(e) { return NaN; }
+              };
+            }
+          } catch(e) { parseErr = e.message; }
+        }
       }
       let coeffs = null, coeffErr = null;
-      if (compiled) {
+      if (compiled && !isPlainEq) {
+        // Adaptive DFT: use fewer samples for low term counts, more for high
+        const dftN = terms <= 30 ? 512 : terms <= 100 ? 1024 : 2048;
         for (const r of [0.5, 0.1, 0.02]) {
           try {
-            const c = computeCoeffs(compiled, center, terms, r, 1024);
+            const c = computeCoeffs(compiled, center, terms, r, dftN, sliderScope);
             if (c && c.every(isFinite)) { coeffs = c; break; }
           } catch(e) { /* smaller radius reduces singularity influence, improving Cauchy integral stability */ }
         }
@@ -556,9 +1150,10 @@ function TaylorApp() {
       const d2C = showDeriv2 && dC ? derivCoeffs(dC) : null;
       const iC = showInteg && coeffs ? integCoeffs(coeffs) : null;
       return { ...expr, compiled, realFn, parseErr, coeffs, coeffErr,
-               dCoeffs: dC, d2Coeffs: d2C, iCoeffs: iC };
+               dCoeffs: dC, d2Coeffs: d2C, iCoeffs: iC,
+               isPlainEq, plainResult, calculusResult };
     });
-  }, [expressions, center, terms, showDeriv, showDeriv2, showInteg]);
+  }, [expressions, center, terms, showDeriv, showDeriv2, showInteg, sliderScope]);
 
   const firstData = exprData.find(e => e.visible && e.realFn && e.coeffs);
 
@@ -636,7 +1231,7 @@ function TaylorApp() {
         </div>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: ".8rem" }}>
           <div style={{ fontSize: ".62rem", color: t.headerInfo, textAlign: "right", fontWeight: 600 }}>
-            f(x) {"\u2248"} {"\u03a3"} c{"\u2099"}{"\u00b7"}(x{"\u2212"}a){"\u207f"} {"\u00b7"} Cauchy{"\u2013"}DFT {"\u00b7"} up to 30 terms
+            f(x) {"\u2248"} {"\u03a3"} c{"\u2099"}{"\u00b7"}(x{"\u2212"}a){"\u207f"} {"\u00b7"} Cauchy{"\u2013"}DFT {"\u00b7"} up to 200 terms
           </div>
           <button style={{ background: t.panel, border: `1px solid ${t.border}`, borderRadius: "6px",
             padding: ".3rem .6rem", cursor: "pointer", fontSize: ".75rem", color: t.text,
@@ -660,60 +1255,117 @@ function TaylorApp() {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div style={{ fontSize: ".75rem", fontWeight: 800, color: t.headerTitle,
                   letterSpacing: ".08em", textTransform: "uppercase" }}>Expressions</div>
-                <button title="Toggle keyboard"
-                  onClick={() => setShowKeyboard(s => !s)}
-                  style={{ background: "none", border: "none", cursor: "pointer",
-                    fontSize: ".85rem", fontWeight: 700,
-                    color: showKeyboard ? t.accent2 : t.textDim }}>{"\u2328"}</button>
+                <div style={{ display: "flex", gap: ".3rem", alignItems: "center" }}>
+                  {/* OCR upload button */}
+                  <input type="file" accept="image/*" ref={fileInputRef}
+                    style={{ display: "none" }}
+                    onChange={e => { if (e.target.files[0]) handleImageUpload(e.target.files[0]); e.target.value = ""; }} />
+                  <button title="Upload image of equation (OCR)"
+                    onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                    style={{ background: "none", border: "none", cursor: "pointer",
+                      fontSize: ".8rem", fontWeight: 700, padding: ".1rem",
+                      color: ocrLoading ? t.accent : t.textDim, opacity: ocrLoading ? 0.5 : 1 }}>
+                    {ocrLoading ? "\u23f3" : "\ud83d\udcf7"}
+                  </button>
+                  <button title="Toggle keyboard"
+                    onClick={() => setShowKeyboard(s => !s)}
+                    style={{ background: "none", border: "none", cursor: "pointer",
+                      fontSize: ".85rem", fontWeight: 700,
+                      color: showKeyboard ? t.accent2 : t.textDim }}>{"\u2328"}</button>
+                </div>
               </div>
 
               {/* Expression cards */}
-              {expressions.map((expr, idx) => (
+              {expressions.map((expr, idx) => {
+                const ed = exprData.find(e => e.id === expr.id);
+                const isPlain = ed && ed.isPlainEq;
+                const result = ed ? ed.plainResult : null;
+                const calcRes = ed ? ed.calculusResult : null;
+                return (
                 <div key={expr.id} style={{
                   background: t.exprCardBg,
                   border: `1px solid ${focusedId === expr.id ? t.accent2 : t.exprCardBorder}`,
-                  borderRadius: "8px", padding: ".5rem .6rem", display: "flex", alignItems: "center",
-                  gap: ".45rem", borderLeft: `3px solid ${expr.color}`,
+                  borderRadius: "8px", padding: ".5rem .6rem",
+                  borderLeft: `3px solid ${expr.color}`,
                   boxShadow: focusedId === expr.id ? "0 0 0 2px rgba(78,205,196,.1)" : "none",
                 }}>
-                  <div style={{ width: 14, height: 14, borderRadius: "50%", background: expr.color, flexShrink: 0 }} />
-                  <input
-                    ref={el => { if (el) inputRefs.current[expr.id] = el; }}
-                    value={expr.text}
-                    onChange={e => updateExpr(expr.id, { text: e.target.value })}
-                    onFocus={() => setFocusedId(expr.id)}
-                    placeholder="e.g. sin(x)"
-                    style={{ flex: 1, fontSize: ".9rem", fontWeight: 600, minWidth: 0,
-                      background: "transparent", border: "none", color: t.text,
-                      outline: "none", padding: ".25rem .3rem" }}
-                  />
-                  {/* Taylor toggle */}
-                  <button title={expr.showTaylor ? "Hide Taylor series" : "Show Taylor series"}
-                    onClick={() => updateExpr(expr.id, { showTaylor: !expr.showTaylor })}
-                    style={{ background: "none", border: "none", cursor: "pointer",
-                      color: expr.showTaylor ? t.accent2 : t.textMuted,
-                      fontSize: ".7rem", fontWeight: 800, padding: ".15rem",
-                      fontFamily: "inherit", opacity: expr.showTaylor ? 1 : 0.5 }}>
-                    T{"\u2099"}
-                  </button>
-                  {/* Visibility toggle */}
-                  <button title={expr.visible ? "Hide function" : "Show function"}
-                    onClick={() => updateExpr(expr.id, { visible: !expr.visible })}
-                    style={{ background: "none", border: "none", cursor: "pointer",
-                      color: expr.visible ? expr.color : t.textMuted, fontSize: ".8rem", padding: ".15rem" }}>
-                    {expr.visible ? "\ud83d\udc41" : "\ud83d\udc41\u200d\ud83d\udde8"}
-                  </button>
-                  {/* Remove */}
-                  {expressions.length > 1 && (
-                    <button title="Remove"
-                      onClick={() => removeExpression(expr.id)}
+                  <div style={{ display: "flex", alignItems: "center", gap: ".4rem" }}>
+                    {/* Color picker — click the dot to change color */}
+                    <div style={{ position: "relative", flexShrink: 0 }}>
+                      <input type="color" value={expr.color}
+                        onChange={e => updateExpr(expr.id, { color: e.target.value })}
+                        style={{ position: "absolute", top: 0, left: 0, width: 18, height: 18,
+                          opacity: 0, cursor: "pointer" }} />
+                      <div style={{ width: 16, height: 16, borderRadius: "50%", background: expr.color,
+                        border: `2px solid ${t.exprCardBorder}`, cursor: "pointer" }} />
+                    </div>
+                    <input
+                      ref={el => { if (el) inputRefs.current[expr.id] = el; }}
+                      value={expr.text}
+                      onChange={e => updateExpr(expr.id, { text: e.target.value })}
+                      onFocus={() => setFocusedId(expr.id)}
+                      placeholder="e.g. sin(x), solve(x^2-4), diff(x^3,x)"
+                      style={{ flex: 1, fontSize: ".88rem", fontWeight: 600, minWidth: 0,
+                        background: "transparent", border: "none", color: t.text,
+                        outline: "none", padding: ".25rem .3rem" }}
+                    />
+                    {/* Taylor toggle — only for graphable functions */}
+                    {!isPlain && ed && ed.realFn && (
+                    <button title={expr.showTaylor ? "Hide Taylor series" : "Show Taylor series"}
+                      onClick={() => updateExpr(expr.id, { showTaylor: !expr.showTaylor })}
                       style={{ background: "none", border: "none", cursor: "pointer",
-                        color: t.textMuted, fontSize: ".85rem", padding: ".15rem", fontFamily: "inherit" }}>
-                      {"\u00d7"}
+                        color: expr.showTaylor ? t.accent2 : t.textMuted,
+                        fontSize: ".7rem", fontWeight: 800, padding: ".15rem",
+                        fontFamily: "inherit", opacity: expr.showTaylor ? 1 : 0.5 }}>
+                      T{"\u2099"}
                     </button>
+                    )}
+                    {/* Visibility toggle */}
+                    <button title={expr.visible ? "Hide" : "Show"}
+                      onClick={() => updateExpr(expr.id, { visible: !expr.visible })}
+                      style={{ background: "none", border: "none", cursor: "pointer",
+                        color: expr.visible ? expr.color : t.textMuted, fontSize: ".75rem", padding: ".15rem" }}>
+                      {expr.visible ? "\ud83d\udc41" : "\ud83d\udc41\u200d\ud83d\udde8"}
+                    </button>
+                    {/* Remove */}
+                    {expressions.length > 1 && (
+                      <button title="Remove"
+                        onClick={() => removeExpression(expr.id)}
+                        style={{ background: "none", border: "none", cursor: "pointer",
+                          color: t.textMuted, fontSize: ".85rem", padding: ".15rem", fontFamily: "inherit" }}>
+                        {"\u00d7"}
+                      </button>
+                    )}
+                  </div>
+                  {/* Calculus engine result (diff, integrate, limit, sum, solve, etc.) */}
+                  {calcRes && (
+                    <div style={{ marginTop: ".35rem", paddingLeft: "1.6rem",
+                      fontSize: ".82rem", fontWeight: 700,
+                      color: calcRes.type === "error" ? t.red : t.accent2 }}>
+                      {calcRes.type === "error" ? ("\u26a0 " + calcRes.result)
+                       : calcRes.type === "symbolic" ? (calcRes.label + " = " + calcRes.result)
+                       : calcRes.type === "solve" ? calcRes.result
+                       : calcRes.type === "numeric"
+                         ? (calcRes.label + " = " + (typeof calcRes.result === "number"
+                             ? (Number.isInteger(calcRes.result) ? calcRes.result.toString()
+                               : calcRes.result.toPrecision(10).replace(/\.?0+$/, ""))
+                             : String(calcRes.result)))
+                       : String(calcRes.result)}
+                    </div>
+                  )}
+                  {/* Plain numeric result (when no calculus, just e.g. 2+2 = 4) */}
+                  {!calcRes && isPlain && result !== null && (
+                    <div style={{ marginTop: ".35rem", paddingLeft: "1.6rem",
+                      fontSize: ".82rem", fontWeight: 700, color: t.accent2 }}>
+                      {"= "}
+                      {typeof result === "number"
+                        ? (Number.isInteger(result) ? result.toString() : result.toPrecision(10).replace(/\.?0+$/, ""))
+                        : String(result)}
+                    </div>
                   )}
                 </div>
-              ))}
+                );
+              })}
 
               {/* Errors */}
               {focusedData && focusedData.parseErr && (
@@ -733,6 +1385,51 @@ function TaylorApp() {
 
               {/* Virtual keyboard */}
               {showKeyboard && <MathKeyboard theme={t} onKey={handleKeyboardKey} />}
+
+              {/* Variable Sliders */}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", cursor: "pointer",
+                  userSelect: "none", padding: ".35rem 0" }}
+                  onClick={() => setShowSliders(s => !s)}>
+                  <div style={{ fontSize: ".7rem", fontWeight: 800, color: t.headerTitle,
+                    letterSpacing: ".06em", textTransform: "uppercase" }}>
+                    {showSliders ? "\u25bc" : "\u25b6"} Variable Sliders
+                  </div>
+                </div>
+                {showSliders && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: ".4rem", paddingTop: ".2rem" }}>
+                    {SLIDER_VARS.map(v => (
+                      <div key={v} style={{ display: "flex", alignItems: "center", gap: ".4rem" }}>
+                        <button onClick={() => updateSlider(v, { active: !sliders[v].active })}
+                          style={{ width: 22, height: 22, borderRadius: "4px", cursor: "pointer",
+                            background: sliders[v].active ? t.accent2 : "transparent",
+                            border: `1.5px solid ${sliders[v].active ? t.accent2 : t.borderDim}`,
+                            color: "#fff", fontSize: ".6rem", fontWeight: 800, fontFamily: "inherit",
+                            display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          {sliders[v].active ? "\u2713" : ""}
+                        </button>
+                        <span style={{ fontSize: ".78rem", fontWeight: 700, color: t.accent3,
+                          minWidth: "1rem", textAlign: "center" }}>{v}</span>
+                        {sliders[v].active ? (
+                          <>
+                            <input type="range"
+                              min={sliders[v].min} max={sliders[v].max} step="0.01"
+                              value={sliders[v].value}
+                              onChange={e => updateSlider(v, { value: parseFloat(e.target.value) })}
+                              style={{ flex: 1, height: "4px" }} />
+                            <span style={{ fontSize: ".68rem", fontWeight: 600, color: t.text,
+                              minWidth: "2.5rem", textAlign: "right" }}>
+                              {sliders[v].value.toFixed(2)}
+                            </span>
+                          </>
+                        ) : (
+                          <span style={{ fontSize: ".62rem", color: t.textMuted, fontWeight: 600 }}>inactive</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
 
               {/* Presets */}
               <div>
@@ -783,11 +1480,11 @@ function TaylorApp() {
                         color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>
                         Number of terms <span style={{ color: t.accent, letterSpacing: 0 }}>N = {terms}</span>
                       </div>
-                      <input type="range" min="1" max="30" value={terms}
+                      <input type="range" min="1" max="200" value={terms}
                         onChange={e => setTerms(+e.target.value)} style={{ width: "100%" }} />
                       <div style={{ display: "flex", justifyContent: "space-between",
                         fontSize: ".55rem", color: t.textMuted, marginTop: ".1rem", fontWeight: 600 }}>
-                        <span>1</span><span>10</span><span>20</span><span>30</span>
+                        <span>1</span><span>50</span><span>100</span><span>150</span><span>200</span>
                       </div>
                     </div>
                     <hr style={{ border: "none", borderTop: `1px solid ${t.borderPanel}` }} />
@@ -1022,3 +1719,6 @@ function TaylorApp() {
     </div>
   );
 }
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<TaylorApp />);

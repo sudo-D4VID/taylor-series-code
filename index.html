@@ -23,32 +23,39 @@ const { useState, useMemo, useRef, useEffect, useCallback } = React;
    MATH UTILITIES
    ========================================================================= */
 
-function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024) {
+function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024, extraScope = {}) {
   const fRe = new Float64Array(N);
   const fIm = new Float64Array(N);
   const TWO_PI_OVER_N = (2 * Math.PI) / N;
+  // Pre-compute cos/sin table for DFT to avoid redundant trig calls
+  const cosTable = new Float64Array(N);
+  const sinTable = new Float64Array(N);
   for (let k = 0; k < N; k++) {
     const theta = TWO_PI_OVER_N * k;
-    const zRe = a + r * Math.cos(theta);
-    const zIm = r * Math.sin(theta);
+    cosTable[k] = Math.cos(theta);
+    sinTable[k] = Math.sin(theta);
+    const zRe = a + r * cosTable[k];
+    const zIm = r * sinTable[k];
     try {
-      const val = compiled.evaluate({ x: math.complex(zRe, zIm) });
+      const val = compiled.evaluate({ x: math.complex(zRe, zIm), ...extraScope });
       if (typeof val === "number")         { fRe[k] = val;    fIm[k] = 0; }
       else if (val != null && "re" in val) { fRe[k] = val.re; fIm[k] = val.im; }
       else                                 { fRe[k] = NaN;    fIm[k] = 0; }
-    } catch(e) { fRe[k] = NaN; fIm[k] = NaN; /* failed sample on circle — skipped via isFinite check in DFT */ }
+    } catch(e) { fRe[k] = NaN; fIm[k] = NaN; }
   }
-  const coeffs = [];
+  const coeffs = new Array(numTerms);
   let rPow = 1;
   for (let n = 0; n < numTerms; n++) {
     let re = 0;
-    const angleStep = -TWO_PI_OVER_N * n;
     for (let k = 0; k < N; k++) {
       if (!isFinite(fRe[k])) continue;
-      const angle = angleStep * k;
-      re += fRe[k] * Math.cos(angle) - fIm[k] * Math.sin(angle);
+      // angle = -TWO_PI_OVER_N * n * k — use trig identities with precomputed table
+      const nk = (n * k) % N;
+      const cosA = cosTable[nk];
+      const sinA = -sinTable[nk]; // negative angle
+      re += fRe[k] * cosA - fIm[k] * sinA;
     }
-    coeffs.push(re / (N * rPow));
+    coeffs[n] = re / (N * rPow);
     rPow *= r;
   }
   return coeffs;
@@ -684,7 +691,7 @@ const KB_TABS = [
   { key: "misc", label: "\u2234", rows: KB_MISC, cols: 6 },
 ];
 
-function MathKeyboard({ theme: t, onKey }) {
+const MathKeyboard = React.memo(function MathKeyboard({ theme: t, onKey }) {
   const [tab, setTab] = React.useState("123");
   const active = KB_TABS.find(tb => tb.key === tab) || KB_TABS[0];
   return (
@@ -720,13 +727,13 @@ function MathKeyboard({ theme: t, onKey }) {
       ))}
     </div>
   );
-}
+});  // React.memo(MathKeyboard)
 
 /* =========================================================================
-   GRAPH COMPONENT (multi-function + ODE)
+   GRAPH COMPONENT (multi-function + ODE) — wrapped in React.memo
    ========================================================================= */
 
-function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDeriv2,
+const Graph = React.memo(function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDeriv2,
                   odeCurve, odeVisible, theme }) {
   const canvasRef = useRef(null);
   const viewRef   = useRef({ cx: 0, cy: 0, scale: 80 });
@@ -932,23 +939,44 @@ function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDe
     return () => cv.removeEventListener("wheel", onWheel);
   }, [onWheel]);
 
-  const onDown = e => { dragRef.current = { x: e.clientX, y: e.clientY, ...viewRef.current }; };
-  const onMove = e => {
+  const onDown = useCallback(e => { dragRef.current = { x: e.clientX, y: e.clientY, ...viewRef.current }; }, []);
+  const onMove = useCallback(e => {
     if (!dragRef.current) return;
     const { x, y, cx, cy, scale } = dragRef.current;
     viewRef.current.cx = cx - (e.clientX - x) / scale;
     viewRef.current.cy = cy + (e.clientY - y) / scale;
     schedRedraw();
-  };
-  const onUp = () => { dragRef.current = null; };
+  }, [schedRedraw]);
+  const onUp = useCallback(() => { dragRef.current = null; }, []);
+
+  const canvasStyle = useMemo(() => ({ display: "block", width: "100%", height: "100%", cursor: "crosshair", touchAction: "none" }), []);
+
+  // Touch support for mobile
+  const onTouchStart = useCallback(e => {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      dragRef.current = { x: t.clientX, y: t.clientY, ...viewRef.current };
+    }
+  }, []);
+  const onTouchMove = useCallback(e => {
+    e.preventDefault();
+    if (!dragRef.current || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const { x, y, cx, cy, scale } = dragRef.current;
+    viewRef.current.cx = cx - (t.clientX - x) / scale;
+    viewRef.current.cy = cy + (t.clientY - y) / scale;
+    schedRedraw();
+  }, [schedRedraw]);
+  const onTouchEnd = useCallback(() => { dragRef.current = null; }, []);
 
   return (
     <canvas ref={canvasRef}
-      style={{ display: "block", width: "100%", height: "100%", cursor: "crosshair" }}
+      style={canvasStyle}
       onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
+      onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
     />
   );
-}
+});  // React.memo(Graph)
 
 /* =========================================================================
    MAIN APP
@@ -1127,11 +1155,11 @@ function TaylorApp() {
       }
       let coeffs = null, coeffErr = null;
       if (compiled && !isPlainEq) {
+        // Adaptive DFT: use fewer samples for low term counts, more for high
+        const dftN = terms <= 30 ? 512 : terms <= 100 ? 1024 : 2048;
         for (const r of [0.5, 0.1, 0.02]) {
           try {
-            const scopeForCoeff = { ...sliderScope };
-            const compiledWithScope = math.compile(expr.text);
-            const c = computeCoeffs(compiledWithScope, center, terms, r, 1024);
+            const c = computeCoeffs(compiled, center, terms, r, dftN, sliderScope);
             if (c && c.every(isFinite)) { coeffs = c; break; }
           } catch(e) { /* smaller radius reduces singularity influence, improving Cauchy integral stability */ }
         }
