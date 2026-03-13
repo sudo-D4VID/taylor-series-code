@@ -433,7 +433,7 @@ function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDe
     const f = e.deltaY < 0 ? 1.2 : 0.833;
     const wMx = (mx - W/2) / scale + cx;
     const wMy = (H/2 - my) / scale + cy;
-    const ns = Math.max(4, Math.min(2e5, scale * f));
+    const ns = Math.max(1e-12, Math.min(1e12, scale * f));
     viewRef.current = { cx: wMx - (mx - W/2)/ns, cy: wMy + (my - H/2)/ns, scale: ns };
     schedRedraw();
   }, [schedRedraw]);
@@ -545,21 +545,43 @@ function TaylorApp() {
   const exprData = useMemo(() => {
     return expressions.map(expr => {
       let compiled = null, realFn = null, parseErr = null;
+      let isPlainEq = false, plainResult = null;
       if (expr.text.trim()) {
         try {
           compiled = math.compile(expr.text);
-          realFn = x => {
+          // Check if expression uses variable x — if not, it's a plain equation
+          const usesX = /\bx\b/i.test(expr.text);
+          if (!usesX) {
             try {
-              const v = compiled.evaluate({ x });
-              if (typeof v === "number") return v;
-              if (v && v.re !== undefined) return Math.abs(v.im || 0) < 1e-9 ? v.re : NaN;
-              return NaN;
-            } catch(e) { return NaN; }
-          };
+              const v = compiled.evaluate({});
+              if (typeof v === "number" && isFinite(v)) {
+                isPlainEq = true;
+                plainResult = v;
+              } else if (v && v.re !== undefined) {
+                isPlainEq = true;
+                plainResult = Math.abs(v.im || 0) < 1e-9 ? v.re : v;
+              } else if (typeof v === "object" && v !== null) {
+                isPlainEq = true;
+                plainResult = v.toString();
+              }
+            } catch(e) {
+              // May still depend on x implicitly; treat as function
+            }
+          }
+          if (!isPlainEq) {
+            realFn = x => {
+              try {
+                const v = compiled.evaluate({ x });
+                if (typeof v === "number") return v;
+                if (v && v.re !== undefined) return Math.abs(v.im || 0) < 1e-9 ? v.re : NaN;
+                return NaN;
+              } catch(e) { return NaN; }
+            };
+          }
         } catch(e) { parseErr = e.message; }
       }
       let coeffs = null, coeffErr = null;
-      if (compiled) {
+      if (compiled && !isPlainEq) {
         for (const r of [0.5, 0.1, 0.02]) {
           try {
             const c = computeCoeffs(compiled, center, terms, r, 1024);
@@ -572,7 +594,8 @@ function TaylorApp() {
       const d2C = showDeriv2 && dC ? derivCoeffs(dC) : null;
       const iC = showInteg && coeffs ? integCoeffs(coeffs) : null;
       return { ...expr, compiled, realFn, parseErr, coeffs, coeffErr,
-               dCoeffs: dC, d2Coeffs: d2C, iCoeffs: iC };
+               dCoeffs: dC, d2Coeffs: d2C, iCoeffs: iC,
+               isPlainEq, plainResult };
     });
   }, [expressions, center, terms, showDeriv, showDeriv2, showInteg]);
 
@@ -684,52 +707,71 @@ function TaylorApp() {
               </div>
 
               {/* Expression cards */}
-              {expressions.map((expr, idx) => (
+              {expressions.map((expr, idx) => {
+                const ed = exprData.find(e => e.id === expr.id);
+                const isPlain = ed && ed.isPlainEq;
+                const result = ed ? ed.plainResult : null;
+                return (
                 <div key={expr.id} style={{
                   background: t.exprCardBg,
                   border: `1px solid ${focusedId === expr.id ? t.accent2 : t.exprCardBorder}`,
-                  borderRadius: "8px", padding: ".5rem .6rem", display: "flex", alignItems: "center",
-                  gap: ".45rem", borderLeft: `3px solid ${expr.color}`,
+                  borderRadius: "8px", padding: ".5rem .6rem",
+                  borderLeft: `3px solid ${expr.color}`,
                   boxShadow: focusedId === expr.id ? "0 0 0 2px rgba(78,205,196,.1)" : "none",
                 }}>
-                  <div style={{ width: 14, height: 14, borderRadius: "50%", background: expr.color, flexShrink: 0 }} />
-                  <input
-                    ref={el => { if (el) inputRefs.current[expr.id] = el; }}
-                    value={expr.text}
-                    onChange={e => updateExpr(expr.id, { text: e.target.value })}
-                    onFocus={() => setFocusedId(expr.id)}
-                    placeholder="e.g. sin(x)"
-                    style={{ flex: 1, fontSize: ".9rem", fontWeight: 600, minWidth: 0,
-                      background: "transparent", border: "none", color: t.text,
-                      outline: "none", padding: ".25rem .3rem" }}
-                  />
-                  {/* Taylor toggle */}
-                  <button title={expr.showTaylor ? "Hide Taylor series" : "Show Taylor series"}
-                    onClick={() => updateExpr(expr.id, { showTaylor: !expr.showTaylor })}
-                    style={{ background: "none", border: "none", cursor: "pointer",
-                      color: expr.showTaylor ? t.accent2 : t.textMuted,
-                      fontSize: ".7rem", fontWeight: 800, padding: ".15rem",
-                      fontFamily: "inherit", opacity: expr.showTaylor ? 1 : 0.5 }}>
-                    T{"\u2099"}
-                  </button>
-                  {/* Visibility toggle */}
-                  <button title={expr.visible ? "Hide function" : "Show function"}
-                    onClick={() => updateExpr(expr.id, { visible: !expr.visible })}
-                    style={{ background: "none", border: "none", cursor: "pointer",
-                      color: expr.visible ? expr.color : t.textMuted, fontSize: ".8rem", padding: ".15rem" }}>
-                    {expr.visible ? "\ud83d\udc41" : "\ud83d\udc41\u200d\ud83d\udde8"}
-                  </button>
-                  {/* Remove */}
-                  {expressions.length > 1 && (
-                    <button title="Remove"
-                      onClick={() => removeExpression(expr.id)}
+                  <div style={{ display: "flex", alignItems: "center", gap: ".45rem" }}>
+                    <div style={{ width: 14, height: 14, borderRadius: "50%", background: expr.color, flexShrink: 0 }} />
+                    <input
+                      ref={el => { if (el) inputRefs.current[expr.id] = el; }}
+                      value={expr.text}
+                      onChange={e => updateExpr(expr.id, { text: e.target.value })}
+                      onFocus={() => setFocusedId(expr.id)}
+                      placeholder="e.g. sin(x) or 2+2"
+                      style={{ flex: 1, fontSize: ".9rem", fontWeight: 600, minWidth: 0,
+                        background: "transparent", border: "none", color: t.text,
+                        outline: "none", padding: ".25rem .3rem" }}
+                    />
+                    {/* Taylor toggle — only for functions (not plain equations) */}
+                    {!isPlain && (
+                    <button title={expr.showTaylor ? "Hide Taylor series" : "Show Taylor series"}
+                      onClick={() => updateExpr(expr.id, { showTaylor: !expr.showTaylor })}
                       style={{ background: "none", border: "none", cursor: "pointer",
-                        color: t.textMuted, fontSize: ".85rem", padding: ".15rem", fontFamily: "inherit" }}>
-                      {"\u00d7"}
+                        color: expr.showTaylor ? t.accent2 : t.textMuted,
+                        fontSize: ".7rem", fontWeight: 800, padding: ".15rem",
+                        fontFamily: "inherit", opacity: expr.showTaylor ? 1 : 0.5 }}>
+                      T{"\u2099"}
                     </button>
+                    )}
+                    {/* Visibility toggle */}
+                    <button title={expr.visible ? "Hide function" : "Show function"}
+                      onClick={() => updateExpr(expr.id, { visible: !expr.visible })}
+                      style={{ background: "none", border: "none", cursor: "pointer",
+                        color: expr.visible ? expr.color : t.textMuted, fontSize: ".8rem", padding: ".15rem" }}>
+                      {expr.visible ? "\ud83d\udc41" : "\ud83d\udc41\u200d\ud83d\udde8"}
+                    </button>
+                    {/* Remove */}
+                    {expressions.length > 1 && (
+                      <button title="Remove"
+                        onClick={() => removeExpression(expr.id)}
+                        style={{ background: "none", border: "none", cursor: "pointer",
+                          color: t.textMuted, fontSize: ".85rem", padding: ".15rem", fontFamily: "inherit" }}>
+                        {"\u00d7"}
+                      </button>
+                    )}
+                  </div>
+                  {/* Inline equation result for plain math expressions */}
+                  {isPlain && result !== null && (
+                    <div style={{ marginTop: ".35rem", paddingLeft: "1.6rem",
+                      fontSize: ".85rem", fontWeight: 700, color: t.accent2 }}>
+                      {"= "}
+                      {typeof result === "number"
+                        ? (Number.isInteger(result) ? result.toString() : result.toPrecision(10).replace(/\.?0+$/, ""))
+                        : String(result)}
+                    </div>
                   )}
                 </div>
-              ))}
+                );
+              })}
 
               {/* Errors */}
               {focusedData && focusedData.parseErr && (
