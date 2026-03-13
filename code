@@ -19,7 +19,7 @@ function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024) {
       if (typeof val === "number")         { fRe[k] = val;    fIm[k] = 0; }
       else if (val != null && "re" in val) { fRe[k] = val.re; fIm[k] = val.im; }
       else                                 { fRe[k] = NaN;    fIm[k] = 0; }
-    } catch(e) { fRe[k] = NaN; fIm[k] = NaN; /* evaluation failed at this sample point */ }
+    } catch(e) { fRe[k] = NaN; fIm[k] = NaN; /* failed sample on circle — skipped via isFinite check in DFT */ }
   }
   const coeffs = [];
   let rPow = 1;
@@ -75,7 +75,7 @@ function fmt(n) {
 
 function solveODE_RK4(fExpr, x0, y0, xMin, xMax, h = 0.01) {
   let compiled;
-  try { compiled = math.compile(fExpr); } catch(e) { return []; /* invalid expression */ }
+  try { compiled = math.compile(fExpr); } catch(e) { return []; /* invalid expression — return empty solution */ }
   const f = (x, y) => {
     try {
       const v = compiled.evaluate({ x, y });
@@ -548,7 +548,7 @@ function TaylorApp() {
           try {
             const c = computeCoeffs(compiled, center, terms, r, 1024);
             if (c && c.every(isFinite)) { coeffs = c; break; }
-          } catch(e) { /* retry with smaller radius for better convergence */ }
+          } catch(e) { /* smaller radius reduces singularity influence, improving Cauchy integral stability */ }
         }
         if (!coeffs) coeffErr = "Could not compute \u2014 try a different center";
       }
