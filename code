@@ -1,6 +1,53 @@
 const { useState, useMemo, useRef, useEffect, useCallback } = React;
 
 /* =========================================================================
+   INLINE SUM / PROD — register rawArgs functions so sum() and prod() can
+   be nested inside any expression (e.g. 1 + sum(...), sum(sum(...), ...))
+   and can reference slider variables from the enclosing evaluation scope.
+   ========================================================================= */
+(function registerInlineFunctions() {
+  // Build a rawArgs loop function (sum or product).
+  // We mutate the live scope (set/restore) so that nested calls can see outer
+  // loop variables — e.g. the inner j-loop sees i from the outer i-loop.
+  function makeLoopFn(fnName, initVal, combine) {
+    const fn = function(args, _math, scope) {
+      if (args.length !== 4) throw new Error(fnName + "(expr, var, start, end): requires 4 arguments");
+      const varNode = args[1];
+      if (!varNode || typeof varNode.name !== "string") throw new Error(fnName + ": second argument must be a variable name");
+      const varName = varNode.name;
+      const start = Math.round(args[2].evaluate(scope));
+      const end   = Math.round(args[3].evaluate(scope));
+      if (!isFinite(start) || !isFinite(end)) throw new Error(fnName + ": start/end must be finite numbers");
+      if (Math.abs(end - start) > 1e5) throw new Error(fnName + ": range too large (max 100k terms)");
+      const compiled = args[0].compile();
+      // Save/restore the loop variable in the shared scope so nested
+      // sum/prod calls can read outer variables (e.g. inner j sees outer i).
+      const hadVar   = scope.has(varName);
+      const savedVal = hadVar ? scope.get(varName) : undefined;
+      let acc = initVal;
+      try {
+        for (let k = start; k <= end; k++) {
+          scope.set(varName, k);
+          const v = compiled.evaluate(scope);
+          if (typeof v !== "number" || !isFinite(v)) throw new Error(fnName + ": non-numeric term at " + varName + "=" + k);
+          acc = combine(acc, v);
+        }
+      } finally {
+        if (hadVar) scope.set(varName, savedVal);
+        else scope.delete(varName);
+      }
+      return acc;
+    };
+    fn.rawArgs = true;
+    return fn;
+  }
+  math.import({
+    sum:  makeLoopFn("sum",  0, (a, b) => a + b),
+    prod: makeLoopFn("prod", 1, (a, b) => a * b),
+  }, { override: true });
+})();
+
+/* =========================================================================
    MATH UTILITIES
    ========================================================================= */
 
@@ -283,7 +330,9 @@ function solveEquation(exprText) {
 
 // Preprocess expression text to handle calculus syntax before math.compile
 // Supported: diff(...), integrate(...), limit(...), sum(...), prod(...), solve(...)
-function preprocessCalculus(text) {
+// scope: optional slider variable values used to evaluate sum/prod bounds
+function preprocessCalculus(text, scope) {
+  const evalScope = scope || {};
   const trimmed = text.trim();
 
   // diff(expr, var) or diff(expr, var, n) — symbolic derivative
@@ -351,12 +400,12 @@ function preprocessCalculus(text) {
     try {
       const compiled = math.compile(m[1]);
       const vName = m[2];
-      const start = Math.round(math.evaluate(m[3]));
-      const end = Math.round(math.evaluate(m[4]));
+      const start = Math.round(math.evaluate(m[3], evalScope));
+      const end = Math.round(math.evaluate(m[4], evalScope));
       if (Math.abs(end - start) > 1e7) return { type: "error", result: "Sum range too large (max 10M terms)" };
       let total = 0;
       for (let i = start; i <= end; i++) {
-        const v = compiled.evaluate({ [vName]: i });
+        const v = compiled.evaluate({ ...evalScope, [vName]: i });
         if (typeof v === "number") total += v;
         else return { type: "error", result: "Non-numeric term in sum" };
       }
@@ -370,12 +419,12 @@ function preprocessCalculus(text) {
     try {
       const compiled = math.compile(m[1]);
       const vName = m[2];
-      const start = Math.round(math.evaluate(m[3]));
-      const end = Math.round(math.evaluate(m[4]));
+      const start = Math.round(math.evaluate(m[3], evalScope));
+      const end = Math.round(math.evaluate(m[4], evalScope));
       if (Math.abs(end - start) > 1e7) return { type: "error", result: "Product range too large (max 10M terms)" };
       let total = 1;
       for (let i = start; i <= end; i++) {
-        const v = compiled.evaluate({ [vName]: i });
+        const v = compiled.evaluate({ ...evalScope, [vName]: i });
         if (typeof v === "number") total *= v;
         else return { type: "error", result: "Non-numeric term in product" };
       }
@@ -437,6 +486,56 @@ function preprocessCalculus(text) {
    Uses Tesseract.js for OCR + post-processing for math syntax
    ========================================================================= */
 
+// Preprocess an image for better OCR accuracy:
+// - Scales up small images (Tesseract works best at ~300 DPI)
+// - Converts to grayscale and binarizes (black text on white background)
+// - Auto-inverts dark-mode screenshots so text is always dark-on-light
+async function preprocessImageForOCR(imageFile) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(imageFile);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement("canvas");
+      // Scale up to at least 1200px on the longest side for better OCR
+      const maxDim = Math.max(img.width, img.height);
+      const scale = maxDim < 1200 ? Math.min(3, 1200 / maxDim) : 1;
+      canvas.width  = Math.round(img.width  * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext("2d");
+      // White background so transparent PNGs don't become black
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imageData.data;
+      // Compute average brightness to detect dark-mode screenshots
+      let brightnessSum = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        brightnessSum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      }
+      const avgBrightness = brightnessSum / (canvas.width * canvas.height);
+      // 128 = midpoint of the 0-255 range; below that the image is mostly dark
+      // (i.e. a dark-mode screenshot where text is light on dark background).
+      const isDark = avgBrightness < 128;
+      // Binarize: convert to pure black (text) or white (background).
+      // Threshold 160 (rather than 128) keeps more stroke pixels black and
+      // avoids dropping thin/antialiased characters to white too early.
+      for (let i = 0; i < data.length; i += 4) {
+        let gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        if (isDark) gray = 255 - gray;  // invert dark-mode so text becomes dark
+        const val = gray < 160 ? 0 : 255;
+        data[i] = data[i + 1] = data[i + 2] = val;
+        data[i + 3] = 255;
+      }
+      ctx.putImageData(imageData, 0, 0);
+      canvas.toBlob(blob => resolve(blob), "image/png");
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Failed to load image")); };
+    img.src = url;
+  });
+}
+
 function postProcessMathOCR(raw) {
   let t = raw.trim();
   // Normalize common OCR misreads and Unicode symbols
@@ -455,15 +554,19 @@ function postProcessMathOCR(raw) {
   t = t.replace(/\u03a0/g, "prod");   // Π
   t = t.replace(/\u221e/g, "Infinity"); // ∞
   // Common OCR misreads
-  t = t.replace(/\bl\b(?=n\s*\()/g, "l");  // keep ln
-  t = t.replace(/\bIn\b/g, "ln");     // In → ln
+  t = t.replace(/\bIn\b/g, "ln");     // OCR reads 'ln' as 'In' (capital-I + n)
   t = t.replace(/\bIog\b/gi, "log");  // Iog → log
   t = t.replace(/\bSin\b/g, "sin");
   t = t.replace(/\bCos\b/g, "cos");
   t = t.replace(/\bTan\b/g, "tan");
+  t = t.replace(/\bExp\b/g, "exp");
+  t = t.replace(/\bSqrt\b/g, "sqrt");
+  t = t.replace(/\bAbs\b/g, "abs");
   t = t.replace(/[{}[\]]/g, c => c === "{" || c === "[" ? "(" : ")");
   // Remove stray characters
   t = t.replace(/[|\\]/g, "");
+  // Strip newlines (PSM 6 may produce multi-line output; join into one line)
+  t = t.replace(/[\r\n]+/g, " ");
   // Collapse whitespace
   t = t.replace(/\s+/g, " ").trim();
   // Implicit multiplication: 2x → 2*x, )x → )*x, )( → )*(
@@ -478,15 +581,16 @@ async function recognizeMathFromImage(imageFile) {
     return { error: "Tesseract.js not loaded" };
   }
   try {
+    const processedBlob = await preprocessImageForOCR(imageFile);
     const worker = await Tesseract.createWorker("eng", 1, {
       corePath: "https://unpkg.com/tesseract.js-core@5.1.0/tesseract-core-simd-lstm.wasm.js",
       workerPath: "https://unpkg.com/tesseract.js@5.1.1/dist/worker.min.js",
     });
     await worker.setParameters({
       tessedit_char_whitelist: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-*/^().,=<>! ",
-      tessedit_pageseg_mode: "7",
+      tessedit_pageseg_mode: "6",
     });
-    const { data } = await worker.recognize(imageFile);
+    const { data } = await worker.recognize(processedBlob);
     await worker.terminate();
     const raw = data.text || "";
     const processed = postProcessMathOCR(raw);
@@ -1126,7 +1230,7 @@ function TaylorApp() {
       let calculusResult = null;
       if (expr.text.trim()) {
         // First try calculus engine (diff, integrate, limit, sum, solve, etc.)
-        calculusResult = preprocessCalculus(expr.text);
+        calculusResult = preprocessCalculus(expr.text, sliderScope);
         if (calculusResult) {
           isPlainEq = true;
           plainResult = calculusResult;
@@ -1138,7 +1242,8 @@ function TaylorApp() {
             if (!usesX) {
               try {
                 const v = compiled.evaluate({ ...sliderScope });
-                if (typeof v === "number" && isFinite(v)) {
+                if (typeof v === "number" && !isNaN(v)) {
+                  // include Infinity so e.g. "1/0" shows "= Infinity"
                   isPlainEq = true;
                   plainResult = v;
                 } else if (v && v.re !== undefined) {
@@ -1148,11 +1253,13 @@ function TaylorApp() {
                   isPlainEq = true;
                   plainResult = v.toString();
                 }
-              } catch(e) {
-                // May still depend on x implicitly; treat as function
+              } catch(evalErr) {
+                // Expression compiled but failed to evaluate (e.g. undefined
+                // slider variable). Show the error instead of silent no-output.
+                parseErr = evalErr.message;
               }
             }
-            if (!isPlainEq) {
+            if (!isPlainEq && !parseErr) {
               realFn = x => {
                 try {
                   const v = compiled.evaluate({ x, ...sliderScope });
@@ -1166,7 +1273,7 @@ function TaylorApp() {
         }
       }
       let coeffs = null, coeffErr = null;
-      if (compiled && !isPlainEq) {
+      if (compiled && !isPlainEq && !parseErr) {
         // Adaptive DFT: use fewer samples for low term counts, more for high
         const dftN = terms <= 30 ? 512 : terms <= 100 ? 1024 : 2048;
         for (const r of [0.5, 0.1, 0.02]) {
@@ -1226,6 +1333,7 @@ function TaylorApp() {
     ["Roots",       "sqrt(x)  cbrt(x)  nthRoot(x,n)"],
     ["Misc",        "abs  sign  floor  ceil  round  mod(a,b)  factorial(n)"],
     ["Constants",   "pi  e  phi  tau  Infinity"],
+    ["Sum / Prod",  "sum(expr,var,start,end)  prod(expr,var,start,end)  — nestable, use sliders for bounds"],
   ];
   const syntaxExamples = [
     "sin(x^2) * exp(-x/2)", "x^3 - 3*x + cos(pi*x)", "exp(-x^2) * cosh(x)",
