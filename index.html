@@ -129,6 +129,295 @@ function solveODE_RK4(fExpr, x0, y0, xMin, xMax, h = 0.01) {
 }
 
 /* =========================================================================
+   CALCULUS ENGINE — symbolic & numerical methods
+   Supports: derivatives, integrals, limits, sums, products, equation solving
+   ========================================================================= */
+
+// Adaptive Simpson's rule for numerical integration
+function adaptiveSimpson(f, a, b, tol, maxDepth) {
+  tol = tol || 1e-10;
+  maxDepth = maxDepth || 50;
+  function simpson(a, b) {
+    const c = (a + b) / 2;
+    return ((b - a) / 6) * (f(a) + 4 * f(c) + f(b));
+  }
+  function recurse(a, b, whole, depth) {
+    const c = (a + b) / 2;
+    const left = simpson(a, c);
+    const right = simpson(c, b);
+    if (depth >= maxDepth || Math.abs(left + right - whole) <= 15 * tol) {
+      return left + right + (left + right - whole) / 15;
+    }
+    return recurse(a, c, left, depth + 1) + recurse(c, b, right, depth + 1);
+  }
+  if (a === b) return 0;
+  if (a > b) return -adaptiveSimpson(f, b, a, tol, maxDepth);
+  return recurse(a, b, simpson(a, b), 0);
+}
+
+// Numerical limit via Richardson extrapolation
+function numericalLimit(f, target, side) {
+  // side: 0=both, 1=right, -1=left
+  side = side || 0;
+  function limitFromSide(dir) {
+    const hs = [];
+    const vals = [];
+    for (let k = 1; k <= 14; k++) {
+      const h = dir * Math.pow(0.1, k);
+      try {
+        const v = f(target + h);
+        if (!isFinite(v)) continue;
+        hs.push(Math.abs(h));
+        vals.push(v);
+      } catch(e) { continue; }
+    }
+    if (vals.length < 3) return NaN;
+    // Richardson extrapolation table
+    let table = vals.slice();
+    for (let j = 1; j < table.length; j++) {
+      const next = [];
+      for (let i = 0; i < table.length - j; i++) {
+        const r = hs[i] / hs[i + j];
+        next.push((r * table[i + 1] - table[i]) / (r - 1));
+      }
+      table = next;
+      if (table.length === 1) break;
+    }
+    return table[0];
+  }
+  if (side > 0) return limitFromSide(1);
+  if (side < 0) return limitFromSide(-1);
+  const left = limitFromSide(-1);
+  const right = limitFromSide(1);
+  if (!isFinite(left) && !isFinite(right)) return NaN;
+  if (!isFinite(left)) return right;
+  if (!isFinite(right)) return left;
+  if (Math.abs(left - right) < 1e-8 * (1 + Math.abs(left))) return (left + right) / 2;
+  return NaN; // limit doesn't exist (left ≠ right)
+}
+
+// Newton-Raphson equation solver: find roots of f(x) = 0
+function solveEquation(exprText) {
+  let lhs = exprText, rhs = "0";
+  if (exprText.includes("=")) {
+    const parts = exprText.split("=");
+    lhs = parts[0].trim();
+    rhs = parts[1].trim();
+  }
+  const diffExpr = "(" + lhs + ")-(" + rhs + ")";
+  let compiled;
+  try { compiled = math.compile(diffExpr); } catch(e) { return { err: e.message }; }
+  const f = x => { try { const v = compiled.evaluate({ x }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+
+  // Try symbolic derivative for Newton's method
+  let df;
+  try {
+    const dNode = math.derivative(diffExpr, "x");
+    const dCompiled = dNode.compile ? dNode.compile() : math.compile(dNode.toString());
+    df = x => { try { const v = dCompiled.evaluate({ x }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+  } catch(e) {
+    // Fallback: numerical derivative
+    df = x => (f(x + 1e-8) - f(x - 1e-8)) / 2e-8;
+  }
+
+  const roots = [];
+  const seen = new Set();
+  // Scan range [-20, 20] for sign changes and try Newton from multiple starting points
+  const starts = [];
+  for (let x = -20; x <= 20; x += 0.25) starts.push(x);
+  // Also add points where sign changes
+  let prevVal = f(-20);
+  for (let x = -19.9; x <= 20; x += 0.1) {
+    const val = f(x);
+    if (isFinite(prevVal) && isFinite(val) && prevVal * val < 0) {
+      // Bisection to narrow down
+      let lo = x - 0.1, hi = x;
+      for (let i = 0; i < 60; i++) {
+        const mid = (lo + hi) / 2;
+        const fm = f(mid);
+        if (!isFinite(fm)) break;
+        if (f(lo) * fm < 0) hi = mid; else lo = mid;
+      }
+      const root = (lo + hi) / 2;
+      const key = root.toFixed(8);
+      if (!seen.has(key) && Math.abs(f(root)) < 1e-6) {
+        seen.add(key);
+        roots.push(root);
+      }
+    }
+    prevVal = val;
+  }
+  // Newton-Raphson from various starting points
+  for (const x0 of starts) {
+    let x = x0;
+    for (let i = 0; i < 100; i++) {
+      const fx = f(x);
+      const dfx = df(x);
+      if (!isFinite(fx) || !isFinite(dfx) || Math.abs(dfx) < 1e-15) break;
+      const xNew = x - fx / dfx;
+      if (Math.abs(xNew - x) < 1e-12) { x = xNew; break; }
+      x = xNew;
+    }
+    if (isFinite(x) && Math.abs(f(x)) < 1e-8) {
+      const key = x.toFixed(8);
+      if (!seen.has(key)) { seen.add(key); roots.push(x); }
+    }
+  }
+  roots.sort((a, b) => a - b);
+  return { roots };
+}
+
+// Preprocess expression text to handle calculus syntax before math.compile
+// Supported: diff(...), integrate(...), limit(...), sum(...), prod(...), solve(...)
+function preprocessCalculus(text) {
+  const trimmed = text.trim();
+
+  // diff(expr, var) or diff(expr, var, n) — symbolic derivative
+  let m = trimmed.match(/^diff\((.+),\s*([a-z]),?\s*(\d+)?\)$/i);
+  if (m) {
+    try {
+      let node = math.parse(m[1]);
+      const v = m[2];
+      const n = parseInt(m[3] || "1");
+      for (let i = 0; i < n; i++) node = math.derivative(node, v);
+      const simplified = math.simplify(node);
+      return { type: "symbolic", label: n > 1 ? `d${n}/d${v}${n}` : `d/d${v}`, result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // d/dx(...) — symbolic derivative shorthand
+  m = trimmed.match(/^d\/d([a-z])\((.+)\)$/i);
+  if (m) {
+    try {
+      const node = math.derivative(m[2], m[1]);
+      const simplified = math.simplify(node);
+      return { type: "symbolic", label: `d/d${m[1]}`, result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // integrate(expr, var, a, b) — definite integral
+  m = trimmed.match(/^integrate\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (!m) m = trimmed.match(/^int\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const a = math.evaluate(m[3]);
+      const b = math.evaluate(m[4]);
+      const f = t => { try { const v = compiled.evaluate({ [vName]: t }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+      const result = adaptiveSimpson(f, a, b);
+      return { type: "numeric", label: `∫[${m[3]},${m[4]}]`, result };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // limit(expr, var, target) or limit(expr, var, target, side)
+  m = trimmed.match(/^limit\((.+),\s*([a-z]),\s*(.+?)(?:,\s*(left|right|[+-]?[01]))?\)$/i);
+  if (!m) m = trimmed.match(/^lim\((.+),\s*([a-z]),\s*(.+?)(?:,\s*(left|right|[+-]?[01]))?\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const target = math.evaluate(m[3]);
+      let side = 0;
+      if (m[4]) {
+        const s = m[4].toLowerCase();
+        if (s === "right" || s === "1" || s === "+1") side = 1;
+        else if (s === "left" || s === "-1") side = -1;
+      }
+      const f = t => { try { const v = compiled.evaluate({ [vName]: t }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
+      const result = numericalLimit(f, target, side);
+      return { type: "numeric", label: `lim(${vName}→${m[3]})`, result };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // sum(expr, var, start, end) — summation
+  m = trimmed.match(/^sum\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const start = Math.round(math.evaluate(m[3]));
+      const end = Math.round(math.evaluate(m[4]));
+      if (Math.abs(end - start) > 1e7) return { type: "error", result: "Sum range too large (max 10M terms)" };
+      let total = 0;
+      for (let i = start; i <= end; i++) {
+        const v = compiled.evaluate({ [vName]: i });
+        if (typeof v === "number") total += v;
+        else return { type: "error", result: "Non-numeric term in sum" };
+      }
+      return { type: "numeric", label: `Σ(${vName}=${start}..${end})`, result: total };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // prod(expr, var, start, end) — product
+  m = trimmed.match(/^prod\((.+),\s*([a-z]),\s*(.+),\s*(.+)\)$/i);
+  if (m) {
+    try {
+      const compiled = math.compile(m[1]);
+      const vName = m[2];
+      const start = Math.round(math.evaluate(m[3]));
+      const end = Math.round(math.evaluate(m[4]));
+      if (Math.abs(end - start) > 1e7) return { type: "error", result: "Product range too large (max 10M terms)" };
+      let total = 1;
+      for (let i = start; i <= end; i++) {
+        const v = compiled.evaluate({ [vName]: i });
+        if (typeof v === "number") total *= v;
+        else return { type: "error", result: "Non-numeric term in product" };
+      }
+      return { type: "numeric", label: `Π(${vName}=${start}..${end})`, result: total };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // solve(expr) or solve(lhs = rhs) — find real roots
+  m = trimmed.match(/^solve\((.+)\)$/i);
+  if (m) {
+    const result = solveEquation(m[1]);
+    if (result.err) return { type: "error", result: result.err };
+    if (result.roots.length === 0) return { type: "solve", label: "solve", roots: [], result: "No real solutions found" };
+    return { type: "solve", label: "solve", roots: result.roots,
+      result: "x = " + result.roots.map(r => {
+        if (Math.abs(r) < 1e-12) return "0";
+        if (Number.isInteger(r)) return r.toString();
+        return r.toPrecision(10).replace(/\.?0+$/, "");
+      }).join(", ") };
+  }
+
+  // simplify(expr) — symbolic simplification
+  m = trimmed.match(/^simplify\((.+)\)$/i);
+  if (m) {
+    try {
+      const simplified = math.simplify(m[1]);
+      return { type: "symbolic", label: "simplify", result: simplified.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // expand(expr) — symbolic expansion via rationalize
+  m = trimmed.match(/^expand\((.+)\)$/i);
+  if (m) {
+    try {
+      const expanded = math.rationalize(m[1]);
+      return { type: "symbolic", label: "expand", result: expanded.toString() };
+    } catch(e) { return { type: "error", result: e.message }; }
+  }
+
+  // Equation with = sign (not inside a function call) — auto-solve
+  if (trimmed.includes("=") && !trimmed.match(/^(diff|integrate|int|limit|lim|sum|prod|solve|simplify|expand)\(/i)) {
+    const result = solveEquation(trimmed);
+    if (result.err) return null; // fall through to normal evaluation
+    if (result.roots.length > 0) {
+      return { type: "solve", label: "solve", roots: result.roots,
+        result: "x = " + result.roots.map(r => {
+          if (Math.abs(r) < 1e-12) return "0";
+          if (Number.isInteger(r)) return r.toString();
+          return r.toPrecision(10).replace(/\.?0+$/, "");
+        }).join(", ") };
+    }
+  }
+
+  return null; // not a calculus expression — use normal evaluation
+}
+
+/* =========================================================================
    THEMES
    ========================================================================= */
 
