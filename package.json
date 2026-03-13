@@ -1,0 +1,24 @@
+{
+  "name": "calculas-focused-calculater",
+  "version": "1.0.0",
+  "description": "automatically find the taylor polynomial of any function with taylor polinomial having upto 50 number of terms . we can change where it is approximated and also shows the true value , approximated value and the percentage of error , plus all of the changes you make appear in a graph in real time and it can be used to study the behavierof the taylor series",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sudo-D4VID/calculas-focused-calculater.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/sudo-D4VID/calculas-focused-calculater/issues"
+  },
+  "homepage": "https://github.com/sudo-D4VID/calculas-focused-calculater#readme",
+  "devDependencies": {
+    "@babel/parser": "^7.29.0"
+  }
+}
