@@ -7,6 +7,7 @@
     <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/mathjs@13.0.0/lib/browser/math.js" crossorigin></script>
+    <script src="https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js" crossorigin></script>
     <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js" crossorigin></script>
     <style>
       html, body, #root { margin: 0; padding: 0; height: 100%; }
@@ -418,6 +419,70 @@ function preprocessCalculus(text) {
 }
 
 /* =========================================================================
+   MATH OCR — recognize math from uploaded images
+   Uses Tesseract.js for OCR + post-processing for math syntax
+   ========================================================================= */
+
+function postProcessMathOCR(raw) {
+  let t = raw.trim();
+  // Normalize common OCR misreads and Unicode symbols
+  t = t.replace(/\u00d7/g, "*");      // ×
+  t = t.replace(/\u00f7/g, "/");      // ÷
+  t = t.replace(/\u2212/g, "-");      // −
+  t = t.replace(/\u2013/g, "-");      // –
+  t = t.replace(/\u2014/g, "-");      // —
+  t = t.replace(/\u00b2/g, "^2");     // ²
+  t = t.replace(/\u00b3/g, "^3");     // ³
+  t = t.replace(/\u221a/g, "sqrt");   // √
+  t = t.replace(/\u03c0/g, "pi");     // π
+  t = t.replace(/\u03b8/g, "x");      // θ → x
+  t = t.replace(/\u222b/g, "integrate"); // ∫
+  t = t.replace(/\u03a3/g, "sum");    // Σ
+  t = t.replace(/\u03a0/g, "prod");   // Π
+  t = t.replace(/\u221e/g, "Infinity"); // ∞
+  // Common OCR misreads
+  t = t.replace(/\bl\b(?=n\s*\()/g, "l");  // keep ln
+  t = t.replace(/\bIn\b/g, "ln");     // In → ln
+  t = t.replace(/\bIog\b/gi, "log");  // Iog → log
+  t = t.replace(/\bSin\b/g, "sin");
+  t = t.replace(/\bCos\b/g, "cos");
+  t = t.replace(/\bTan\b/g, "tan");
+  t = t.replace(/[{}[\]]/g, c => c === "{" || c === "[" ? "(" : ")");
+  // Remove stray characters
+  t = t.replace(/[|\\]/g, "");
+  // Collapse whitespace
+  t = t.replace(/\s+/g, " ").trim();
+  // Implicit multiplication: 2x → 2*x, )x → )*x, )( → )*(
+  t = t.replace(/(\d)([a-zA-Z(])/g, "$1*$2");
+  t = t.replace(/\)(\()/g, ")*(");
+  t = t.replace(/\)([a-zA-Z])/g, ")*$1");
+  return t;
+}
+
+async function recognizeMathFromImage(imageFile) {
+  if (typeof Tesseract === "undefined") {
+    return { error: "Tesseract.js not loaded" };
+  }
+  try {
+    const worker = await Tesseract.createWorker("eng", 1, {
+      corePath: "https://unpkg.com/tesseract.js-core@5.1.0/tesseract-core-simd-lstm.wasm.js",
+      workerPath: "https://unpkg.com/tesseract.js@5.1.1/dist/worker.min.js",
+    });
+    await worker.setParameters({
+      tessedit_char_whitelist: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-*/^().,=<>! ",
+      tessedit_pageseg_mode: "7",
+    });
+    const { data } = await worker.recognize(imageFile);
+    await worker.terminate();
+    const raw = data.text || "";
+    const processed = postProcessMathOCR(raw);
+    return { raw, processed };
+  } catch(e) {
+    return { error: e.message || "OCR failed" };
+  }
+}
+
+/* =========================================================================
    THEMES
    ========================================================================= */
 
@@ -477,42 +542,175 @@ const PRESETS = [
    VIRTUAL MATH KEYBOARD
    ========================================================================= */
 
-const KB_ROWS = [
+/* =========================================================================
+   DESMOS-STYLE KEYBOARD — all sections
+   Tabs: 123, functions, ABC, αβγ (Greek), misc
+   ========================================================================= */
+
+const KB_123 = [
+  [
+    { label: "\u00b9\u2044\u2093", insert: "/" },
+    { label: "x\u00b2", insert: "^2" },
+    { label: "x\u02b8", insert: "^" },
+    { label: "\u221a", insert: "sqrt(" },
+    { label: "\u221b", insert: "cbrt(" },
+    { label: "\u207f\u221a", insert: "nthRoot(" },
+  ],
   [
     { label: "7", insert: "7" }, { label: "8", insert: "8" }, { label: "9", insert: "9" },
-    { label: "\u00f7", insert: "/" }, { label: "sin", insert: "sin(" }, { label: "cos", insert: "cos(" },
-    { label: "tan", insert: "tan(" }, { label: "\u03c0", insert: "pi" },
+    { label: "\u00f7", insert: "/" }, { label: "(", insert: "(" }, { label: ")", insert: ")" },
   ],
   [
     { label: "4", insert: "4" }, { label: "5", insert: "5" }, { label: "6", insert: "6" },
-    { label: "\u00d7", insert: "*" }, { label: "exp", insert: "exp(" }, { label: "ln", insert: "ln(" },
-    { label: "sqrt", insert: "sqrt(" }, { label: "e", insert: "e" },
+    { label: "\u00d7", insert: "*" }, { label: "|a|", insert: "abs(" }, { label: "\u03c0", insert: "pi" },
   ],
   [
     { label: "1", insert: "1" }, { label: "2", insert: "2" }, { label: "3", insert: "3" },
-    { label: "\u2212", insert: "-" }, { label: "abs", insert: "abs(" }, { label: "^", insert: "^" },
-    { label: "(", insert: "(" }, { label: ")", insert: ")" },
+    { label: "\u2212", insert: "-" }, { label: ",", insert: ", " }, { label: "e", insert: "e" },
   ],
   [
-    { label: "0", insert: "0" }, { label: ".", insert: "." }, { label: "x", insert: "x" },
-    { label: "+", insert: "+" }, { label: "asin", insert: "asin(" }, { label: "acos", insert: "acos(" },
-    { label: "atan", insert: "atan(" }, { label: "\u232b", insert: "__BACKSPACE__" },
+    { label: "0", insert: "0" }, { label: ".", insert: "." }, { label: "=", insert: "=" },
+    { label: "+", insert: "+" }, { label: "x", insert: "x" }, { label: "\u232b", insert: "__BACKSPACE__" },
   ],
 ];
 
+const KB_FUNC = [
+  [
+    { label: "sin", insert: "sin(" }, { label: "cos", insert: "cos(" },
+    { label: "tan", insert: "tan(" }, { label: "csc", insert: "csc(" },
+    { label: "sec", insert: "sec(" }, { label: "cot", insert: "cot(" },
+  ],
+  [
+    { label: "sin\u207b\u00b9", insert: "asin(" }, { label: "cos\u207b\u00b9", insert: "acos(" },
+    { label: "tan\u207b\u00b9", insert: "atan(" }, { label: "csc\u207b\u00b9", insert: "acsc(" },
+    { label: "sec\u207b\u00b9", insert: "asec(" }, { label: "cot\u207b\u00b9", insert: "acot(" },
+  ],
+  [
+    { label: "sinh", insert: "sinh(" }, { label: "cosh", insert: "cosh(" },
+    { label: "tanh", insert: "tanh(" }, { label: "csch", insert: "csch(" },
+    { label: "sech", insert: "sech(" }, { label: "coth", insert: "coth(" },
+  ],
+  [
+    { label: "ln", insert: "ln(" }, { label: "log", insert: "log(" },
+    { label: "exp", insert: "exp(" }, { label: "n!", insert: "factorial(" },
+    { label: "nCr", insert: "combinations(" }, { label: "nPr", insert: "permutations(" },
+  ],
+  [
+    { label: "floor", insert: "floor(" }, { label: "ceil", insert: "ceil(" },
+    { label: "round", insert: "round(" }, { label: "sign", insert: "sign(" },
+    { label: "min", insert: "min(" }, { label: "max", insert: "max(" },
+  ],
+  [
+    { label: "mod", insert: "mod(" }, { label: "gcd", insert: "gcd(" },
+    { label: "lcm", insert: "lcm(" }, { label: "rand", insert: "random()" },
+    { label: "(", insert: "(" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_ABC = [
+  [
+    { label: "a", insert: "a" }, { label: "b", insert: "b" }, { label: "c", insert: "c" },
+    { label: "d", insert: "d" }, { label: "e", insert: "e" }, { label: "f", insert: "f" },
+    { label: "g", insert: "g" },
+  ],
+  [
+    { label: "h", insert: "h" }, { label: "i", insert: "i" }, { label: "j", insert: "j" },
+    { label: "k", insert: "k" }, { label: "l", insert: "l" }, { label: "m", insert: "m" },
+    { label: "n", insert: "n" },
+  ],
+  [
+    { label: "o", insert: "o" }, { label: "p", insert: "p" }, { label: "q", insert: "q" },
+    { label: "r", insert: "r" }, { label: "s", insert: "s" }, { label: "t", insert: "t" },
+    { label: "u", insert: "u" },
+  ],
+  [
+    { label: "v", insert: "v" }, { label: "w", insert: "w" }, { label: "x", insert: "x" },
+    { label: "y", insert: "y" }, { label: "z", insert: "z" }, { label: "_", insert: "_" },
+    { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_GREEK = [
+  [
+    { label: "\u03b1", insert: "alpha" }, { label: "\u03b2", insert: "beta" },
+    { label: "\u03b3", insert: "gamma" }, { label: "\u03b4", insert: "delta" },
+    { label: "\u03b5", insert: "epsilon" }, { label: "\u03b6", insert: "zeta" },
+  ],
+  [
+    { label: "\u03b7", insert: "eta" }, { label: "\u03b8", insert: "theta" },
+    { label: "\u03b9", insert: "iota" }, { label: "\u03ba", insert: "kappa" },
+    { label: "\u03bb", insert: "lambda" }, { label: "\u03bc", insert: "mu" },
+  ],
+  [
+    { label: "\u03bd", insert: "nu" }, { label: "\u03be", insert: "xi" },
+    { label: "\u03c0", insert: "pi" }, { label: "\u03c1", insert: "rho" },
+    { label: "\u03c3", insert: "sigma" }, { label: "\u03c4", insert: "tau" },
+  ],
+  [
+    { label: "\u03c5", insert: "upsilon" }, { label: "\u03c6", insert: "phi" },
+    { label: "\u03c7", insert: "chi" }, { label: "\u03c8", insert: "psi" },
+    { label: "\u03c9", insert: "omega" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_MISC = [
+  [
+    { label: "\u2264", insert: "<=" }, { label: "\u2265", insert: ">=" },
+    { label: "<", insert: "<" }, { label: ">", insert: ">" },
+    { label: "\u2260", insert: "!=" }, { label: "=", insert: "=" },
+  ],
+  [
+    { label: "d/dx", insert: "d/dx(" }, { label: "\u222b", insert: "integrate(" },
+    { label: "lim", insert: "limit(" }, { label: "\u03a3", insert: "sum(" },
+    { label: "\u03a0", insert: "prod(" }, { label: "solve", insert: "solve(" },
+  ],
+  [
+    { label: "diff", insert: "diff(" }, { label: "simpl", insert: "simplify(" },
+    { label: "expand", insert: "expand(" }, { label: "\u221e", insert: "Infinity" },
+    { label: "true", insert: "true" }, { label: "false", insert: "false" },
+  ],
+  [
+    { label: "[", insert: "[" }, { label: "]", insert: "]" },
+    { label: "{", insert: "{" }, { label: "}", insert: "}" },
+    { label: ";", insert: ";" }, { label: "\u232b", insert: "__BACKSPACE__" },
+  ],
+];
+
+const KB_TABS = [
+  { key: "123", label: "123", rows: KB_123, cols: 6 },
+  { key: "func", label: "f(x)", rows: KB_FUNC, cols: 6 },
+  { key: "abc", label: "ABC", rows: KB_ABC, cols: 7 },
+  { key: "greek", label: "\u03b1\u03b2\u03b3", rows: KB_GREEK, cols: 6 },
+  { key: "misc", label: "\u2234", rows: KB_MISC, cols: 6 },
+];
+
 function MathKeyboard({ theme: t, onKey }) {
+  const [tab, setTab] = React.useState("123");
+  const active = KB_TABS.find(tb => tb.key === tab) || KB_TABS[0];
   return (
     <div style={{ background: t.kbBg, border: `1px solid ${t.borderDim}`, padding: ".4rem",
       display: "flex", flexDirection: "column", gap: ".3rem", borderRadius: "8px" }}>
-      {KB_ROWS.map((row, ri) => (
-        <div key={ri} style={{ display: "grid", gridTemplateColumns: "repeat(8, 1fr)", gap: ".25rem" }}>
+      <div style={{ display: "flex", gap: ".2rem", marginBottom: ".1rem" }}>
+        {KB_TABS.map(tb => (
+          <button key={tb.key} onClick={() => setTab(tb.key)}
+            style={{ flex: 1, background: tab === tb.key ? t.accent2 : t.kbBtnBg,
+              border: `1px solid ${tab === tb.key ? t.accent2 : t.kbBtnBorder}`, borderRadius: "5px",
+              padding: ".22rem .1rem", cursor: "pointer",
+              color: tab === tb.key ? "#fff" : t.text,
+              fontFamily: "inherit", fontSize: ".6rem", fontWeight: 700 }}>
+            {tb.label}
+          </button>
+        ))}
+      </div>
+      {active.rows.map((row, ri) => (
+        <div key={ri} style={{ display: "grid", gridTemplateColumns: `repeat(${active.cols}, 1fr)`, gap: ".22rem" }}>
           {row.map((btn, bi) => (
             <button key={bi}
               onMouseDown={e => { e.preventDefault(); onKey(btn.insert); }}
               style={{
                 background: t.kbBtnBg, border: `1px solid ${t.kbBtnBorder}`,
-                borderRadius: "6px", padding: ".35rem .1rem", cursor: "pointer",
-                color: t.text, fontFamily: "inherit", fontSize: ".72rem", fontWeight: 600,
+                borderRadius: "6px", padding: ".36rem .08rem", cursor: "pointer",
+                color: t.text, fontFamily: "inherit", fontSize: ".68rem", fontWeight: 600,
               }}
               onMouseEnter={e => { e.currentTarget.style.background = t.kbBtnHover; }}
               onMouseLeave={e => { e.currentTarget.style.background = t.kbBtnBg; }}
@@ -783,6 +981,56 @@ function TaylorApp() {
   const [odeY0,      setOdeY0]      = useState(1);
   const [odeVisible, setOdeVisible] = useState(true);
 
+  // Variable sliders: a-v (excluding x, y, z, w which stay as free variables)
+  const SLIDER_VARS = "a,b,c,d,f,g,h,k,m,n,p,q,r,s,t,u,v".split(",");
+  const [sliders, setSliders] = useState(() => {
+    const init = {};
+    SLIDER_VARS.forEach(v => { init[v] = { value: 1, min: -10, max: 10, active: false }; });
+    return init;
+  });
+  const [showSliders, setShowSliders] = useState(false);
+
+  const updateSlider = (v, updates) => {
+    setSliders(prev => ({ ...prev, [v]: { ...prev[v], ...updates } }));
+  };
+
+  // Build slider scope for expression evaluation
+  const sliderScope = useMemo(() => {
+    const scope = {};
+    SLIDER_VARS.forEach(v => { if (sliders[v].active) scope[v] = sliders[v].value; });
+    return scope;
+  }, [sliders]);
+
+  // OCR image upload state
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const handleImageUpload = async (file) => {
+    if (!file) return;
+    setOcrLoading(true);
+    try {
+      const result = await recognizeMathFromImage(file);
+      if (result.error) {
+        alert("OCR Error: " + result.error);
+      } else if (result.processed) {
+        if (focusedId) {
+          updateExpr(focusedId, { text: result.processed });
+        } else {
+          addExpression();
+          setTimeout(() => {
+            setExpressions(prev => {
+              const last = prev[prev.length - 1];
+              return prev.map(e => e.id === last.id ? { ...e, text: result.processed } : e);
+            });
+          }, 50);
+        }
+      }
+    } catch(e) {
+      alert("OCR failed: " + e.message);
+    }
+    setOcrLoading(false);
+  };
+
   const t = THEMES[themeMode];
 
   const addExpression = () => {
@@ -830,50 +1078,60 @@ function TaylorApp() {
     setTimeout(() => { el.focus(); el.setSelectionRange(newPos, newPos); }, 0);
   };
 
-  // Compile all expressions
+  // Compile all expressions (with calculus engine + slider variables)
   const exprData = useMemo(() => {
     return expressions.map(expr => {
       let compiled = null, realFn = null, parseErr = null;
       let isPlainEq = false, plainResult = null;
+      let calculusResult = null;
       if (expr.text.trim()) {
-        try {
-          compiled = math.compile(expr.text);
-          // Check if expression uses variable x — if not, it's a plain equation
-          const usesX = /\bx\b/i.test(expr.text);
-          if (!usesX) {
-            try {
-              const v = compiled.evaluate({});
-              if (typeof v === "number" && isFinite(v)) {
-                isPlainEq = true;
-                plainResult = v;
-              } else if (v && v.re !== undefined) {
-                isPlainEq = true;
-                plainResult = Math.abs(v.im || 0) < 1e-9 ? v.re : v;
-              } else if (typeof v === "object" && v !== null) {
-                isPlainEq = true;
-                plainResult = v.toString();
-              }
-            } catch(e) {
-              // May still depend on x implicitly; treat as function
-            }
-          }
-          if (!isPlainEq) {
-            realFn = x => {
+        // First try calculus engine (diff, integrate, limit, sum, solve, etc.)
+        calculusResult = preprocessCalculus(expr.text);
+        if (calculusResult) {
+          isPlainEq = true;
+          plainResult = calculusResult;
+        } else {
+          try {
+            compiled = math.compile(expr.text);
+            // Check if expression uses variable x — if not, it's a plain equation
+            const usesX = /\bx\b/i.test(expr.text);
+            if (!usesX) {
               try {
-                const v = compiled.evaluate({ x });
-                if (typeof v === "number") return v;
-                if (v && v.re !== undefined) return Math.abs(v.im || 0) < 1e-9 ? v.re : NaN;
-                return NaN;
-              } catch(e) { return NaN; }
-            };
-          }
-        } catch(e) { parseErr = e.message; }
+                const v = compiled.evaluate({ ...sliderScope });
+                if (typeof v === "number" && isFinite(v)) {
+                  isPlainEq = true;
+                  plainResult = v;
+                } else if (v && v.re !== undefined) {
+                  isPlainEq = true;
+                  plainResult = Math.abs(v.im || 0) < 1e-9 ? v.re : v;
+                } else if (typeof v === "object" && v !== null) {
+                  isPlainEq = true;
+                  plainResult = v.toString();
+                }
+              } catch(e) {
+                // May still depend on x implicitly; treat as function
+              }
+            }
+            if (!isPlainEq) {
+              realFn = x => {
+                try {
+                  const v = compiled.evaluate({ x, ...sliderScope });
+                  if (typeof v === "number") return v;
+                  if (v && v.re !== undefined) return Math.abs(v.im || 0) < 1e-9 ? v.re : NaN;
+                  return NaN;
+                } catch(e) { return NaN; }
+              };
+            }
+          } catch(e) { parseErr = e.message; }
+        }
       }
       let coeffs = null, coeffErr = null;
       if (compiled && !isPlainEq) {
         for (const r of [0.5, 0.1, 0.02]) {
           try {
-            const c = computeCoeffs(compiled, center, terms, r, 1024);
+            const scopeForCoeff = { ...sliderScope };
+            const compiledWithScope = math.compile(expr.text);
+            const c = computeCoeffs(compiledWithScope, center, terms, r, 1024);
             if (c && c.every(isFinite)) { coeffs = c; break; }
           } catch(e) { /* smaller radius reduces singularity influence, improving Cauchy integral stability */ }
         }
@@ -884,9 +1142,9 @@ function TaylorApp() {
       const iC = showInteg && coeffs ? integCoeffs(coeffs) : null;
       return { ...expr, compiled, realFn, parseErr, coeffs, coeffErr,
                dCoeffs: dC, d2Coeffs: d2C, iCoeffs: iC,
-               isPlainEq, plainResult };
+               isPlainEq, plainResult, calculusResult };
     });
-  }, [expressions, center, terms, showDeriv, showDeriv2, showInteg]);
+  }, [expressions, center, terms, showDeriv, showDeriv2, showInteg, sliderScope]);
 
   const firstData = exprData.find(e => e.visible && e.realFn && e.coeffs);
 
@@ -964,7 +1222,7 @@ function TaylorApp() {
         </div>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: ".8rem" }}>
           <div style={{ fontSize: ".62rem", color: t.headerInfo, textAlign: "right", fontWeight: 600 }}>
-            f(x) {"\u2248"} {"\u03a3"} c{"\u2099"}{"\u00b7"}(x{"\u2212"}a){"\u207f"} {"\u00b7"} Cauchy{"\u2013"}DFT {"\u00b7"} up to 30 terms
+            f(x) {"\u2248"} {"\u03a3"} c{"\u2099"}{"\u00b7"}(x{"\u2212"}a){"\u207f"} {"\u00b7"} Cauchy{"\u2013"}DFT {"\u00b7"} up to 200 terms
           </div>
           <button style={{ background: t.panel, border: `1px solid ${t.border}`, borderRadius: "6px",
             padding: ".3rem .6rem", cursor: "pointer", fontSize: ".75rem", color: t.text,
@@ -988,11 +1246,24 @@ function TaylorApp() {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <div style={{ fontSize: ".75rem", fontWeight: 800, color: t.headerTitle,
                   letterSpacing: ".08em", textTransform: "uppercase" }}>Expressions</div>
-                <button title="Toggle keyboard"
-                  onClick={() => setShowKeyboard(s => !s)}
-                  style={{ background: "none", border: "none", cursor: "pointer",
-                    fontSize: ".85rem", fontWeight: 700,
-                    color: showKeyboard ? t.accent2 : t.textDim }}>{"\u2328"}</button>
+                <div style={{ display: "flex", gap: ".3rem", alignItems: "center" }}>
+                  {/* OCR upload button */}
+                  <input type="file" accept="image/*" ref={fileInputRef}
+                    style={{ display: "none" }}
+                    onChange={e => { if (e.target.files[0]) handleImageUpload(e.target.files[0]); e.target.value = ""; }} />
+                  <button title="Upload image of equation (OCR)"
+                    onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                    style={{ background: "none", border: "none", cursor: "pointer",
+                      fontSize: ".8rem", fontWeight: 700, padding: ".1rem",
+                      color: ocrLoading ? t.accent : t.textDim, opacity: ocrLoading ? 0.5 : 1 }}>
+                    {ocrLoading ? "\u23f3" : "\ud83d\udcf7"}
+                  </button>
+                  <button title="Toggle keyboard"
+                    onClick={() => setShowKeyboard(s => !s)}
+                    style={{ background: "none", border: "none", cursor: "pointer",
+                      fontSize: ".85rem", fontWeight: 700,
+                      color: showKeyboard ? t.accent2 : t.textDim }}>{"\u2328"}</button>
+                </div>
               </div>
 
               {/* Expression cards */}
@@ -1000,6 +1271,7 @@ function TaylorApp() {
                 const ed = exprData.find(e => e.id === expr.id);
                 const isPlain = ed && ed.isPlainEq;
                 const result = ed ? ed.plainResult : null;
+                const calcRes = ed ? ed.calculusResult : null;
                 return (
                 <div key={expr.id} style={{
                   background: t.exprCardBg,
@@ -1008,20 +1280,28 @@ function TaylorApp() {
                   borderLeft: `3px solid ${expr.color}`,
                   boxShadow: focusedId === expr.id ? "0 0 0 2px rgba(78,205,196,.1)" : "none",
                 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: ".45rem" }}>
-                    <div style={{ width: 14, height: 14, borderRadius: "50%", background: expr.color, flexShrink: 0 }} />
+                  <div style={{ display: "flex", alignItems: "center", gap: ".4rem" }}>
+                    {/* Color picker — click the dot to change color */}
+                    <div style={{ position: "relative", flexShrink: 0 }}>
+                      <input type="color" value={expr.color}
+                        onChange={e => updateExpr(expr.id, { color: e.target.value })}
+                        style={{ position: "absolute", top: 0, left: 0, width: 18, height: 18,
+                          opacity: 0, cursor: "pointer" }} />
+                      <div style={{ width: 16, height: 16, borderRadius: "50%", background: expr.color,
+                        border: `2px solid ${t.exprCardBorder}`, cursor: "pointer" }} />
+                    </div>
                     <input
                       ref={el => { if (el) inputRefs.current[expr.id] = el; }}
                       value={expr.text}
                       onChange={e => updateExpr(expr.id, { text: e.target.value })}
                       onFocus={() => setFocusedId(expr.id)}
-                      placeholder="e.g. sin(x) or 2+2"
-                      style={{ flex: 1, fontSize: ".9rem", fontWeight: 600, minWidth: 0,
+                      placeholder="e.g. sin(x), solve(x^2-4), diff(x^3,x)"
+                      style={{ flex: 1, fontSize: ".88rem", fontWeight: 600, minWidth: 0,
                         background: "transparent", border: "none", color: t.text,
                         outline: "none", padding: ".25rem .3rem" }}
                     />
-                    {/* Taylor toggle — only for functions (not plain equations) */}
-                    {!isPlain && (
+                    {/* Taylor toggle — only for graphable functions */}
+                    {!isPlain && ed && ed.realFn && (
                     <button title={expr.showTaylor ? "Hide Taylor series" : "Show Taylor series"}
                       onClick={() => updateExpr(expr.id, { showTaylor: !expr.showTaylor })}
                       style={{ background: "none", border: "none", cursor: "pointer",
@@ -1032,10 +1312,10 @@ function TaylorApp() {
                     </button>
                     )}
                     {/* Visibility toggle */}
-                    <button title={expr.visible ? "Hide function" : "Show function"}
+                    <button title={expr.visible ? "Hide" : "Show"}
                       onClick={() => updateExpr(expr.id, { visible: !expr.visible })}
                       style={{ background: "none", border: "none", cursor: "pointer",
-                        color: expr.visible ? expr.color : t.textMuted, fontSize: ".8rem", padding: ".15rem" }}>
+                        color: expr.visible ? expr.color : t.textMuted, fontSize: ".75rem", padding: ".15rem" }}>
                       {expr.visible ? "\ud83d\udc41" : "\ud83d\udc41\u200d\ud83d\udde8"}
                     </button>
                     {/* Remove */}
@@ -1048,10 +1328,26 @@ function TaylorApp() {
                       </button>
                     )}
                   </div>
-                  {/* Inline equation result for plain math expressions */}
-                  {isPlain && result !== null && (
+                  {/* Calculus engine result (diff, integrate, limit, sum, solve, etc.) */}
+                  {calcRes && (
                     <div style={{ marginTop: ".35rem", paddingLeft: "1.6rem",
-                      fontSize: ".85rem", fontWeight: 700, color: t.accent2 }}>
+                      fontSize: ".82rem", fontWeight: 700,
+                      color: calcRes.type === "error" ? t.red : t.accent2 }}>
+                      {calcRes.type === "error" ? ("\u26a0 " + calcRes.result)
+                       : calcRes.type === "symbolic" ? (calcRes.label + " = " + calcRes.result)
+                       : calcRes.type === "solve" ? calcRes.result
+                       : calcRes.type === "numeric"
+                         ? (calcRes.label + " = " + (typeof calcRes.result === "number"
+                             ? (Number.isInteger(calcRes.result) ? calcRes.result.toString()
+                               : calcRes.result.toPrecision(10).replace(/\.?0+$/, ""))
+                             : String(calcRes.result)))
+                       : String(calcRes.result)}
+                    </div>
+                  )}
+                  {/* Plain numeric result (when no calculus, just e.g. 2+2 = 4) */}
+                  {!calcRes && isPlain && result !== null && (
+                    <div style={{ marginTop: ".35rem", paddingLeft: "1.6rem",
+                      fontSize: ".82rem", fontWeight: 700, color: t.accent2 }}>
                       {"= "}
                       {typeof result === "number"
                         ? (Number.isInteger(result) ? result.toString() : result.toPrecision(10).replace(/\.?0+$/, ""))
@@ -1080,6 +1376,51 @@ function TaylorApp() {
 
               {/* Virtual keyboard */}
               {showKeyboard && <MathKeyboard theme={t} onKey={handleKeyboardKey} />}
+
+              {/* Variable Sliders */}
+              <div>
+                <div style={{ display: "flex", alignItems: "center", cursor: "pointer",
+                  userSelect: "none", padding: ".35rem 0" }}
+                  onClick={() => setShowSliders(s => !s)}>
+                  <div style={{ fontSize: ".7rem", fontWeight: 800, color: t.headerTitle,
+                    letterSpacing: ".06em", textTransform: "uppercase" }}>
+                    {showSliders ? "\u25bc" : "\u25b6"} Variable Sliders
+                  </div>
+                </div>
+                {showSliders && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: ".4rem", paddingTop: ".2rem" }}>
+                    {SLIDER_VARS.map(v => (
+                      <div key={v} style={{ display: "flex", alignItems: "center", gap: ".4rem" }}>
+                        <button onClick={() => updateSlider(v, { active: !sliders[v].active })}
+                          style={{ width: 22, height: 22, borderRadius: "4px", cursor: "pointer",
+                            background: sliders[v].active ? t.accent2 : "transparent",
+                            border: `1.5px solid ${sliders[v].active ? t.accent2 : t.borderDim}`,
+                            color: "#fff", fontSize: ".6rem", fontWeight: 800, fontFamily: "inherit",
+                            display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          {sliders[v].active ? "\u2713" : ""}
+                        </button>
+                        <span style={{ fontSize: ".78rem", fontWeight: 700, color: t.accent3,
+                          minWidth: "1rem", textAlign: "center" }}>{v}</span>
+                        {sliders[v].active ? (
+                          <>
+                            <input type="range"
+                              min={sliders[v].min} max={sliders[v].max} step="0.01"
+                              value={sliders[v].value}
+                              onChange={e => updateSlider(v, { value: parseFloat(e.target.value) })}
+                              style={{ flex: 1, height: "4px" }} />
+                            <span style={{ fontSize: ".68rem", fontWeight: 600, color: t.text,
+                              minWidth: "2.5rem", textAlign: "right" }}>
+                              {sliders[v].value.toFixed(2)}
+                            </span>
+                          </>
+                        ) : (
+                          <span style={{ fontSize: ".62rem", color: t.textMuted, fontWeight: 600 }}>inactive</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
 
               {/* Presets */}
               <div>
@@ -1130,11 +1471,11 @@ function TaylorApp() {
                         color: t.lblColor, marginBottom: ".32rem", fontWeight: 700 }}>
                         Number of terms <span style={{ color: t.accent, letterSpacing: 0 }}>N = {terms}</span>
                       </div>
-                      <input type="range" min="1" max="30" value={terms}
+                      <input type="range" min="1" max="200" value={terms}
                         onChange={e => setTerms(+e.target.value)} style={{ width: "100%" }} />
                       <div style={{ display: "flex", justifyContent: "space-between",
                         fontSize: ".55rem", color: t.textMuted, marginTop: ".1rem", fontWeight: 600 }}>
-                        <span>1</span><span>10</span><span>20</span><span>30</span>
+                        <span>1</span><span>50</span><span>100</span><span>150</span><span>200</span>
                       </div>
                     </div>
                     <hr style={{ border: "none", borderTop: `1px solid ${t.borderPanel}` }} />
