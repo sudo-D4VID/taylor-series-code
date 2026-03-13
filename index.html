@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Taylor Polynomial Calculator</title>
+    <title>Low Cortisol Calculas</title>
     <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/mathjs@13.0.0/lib/browser/math.js" crossorigin></script>
@@ -730,7 +730,7 @@ const MathKeyboard = React.memo(function MathKeyboard({ theme: t, onKey }) {
               border: `1px solid ${tab === tb.key ? t.accent2 : t.kbBtnBorder}`, borderRadius: "5px",
               padding: ".22rem .1rem", cursor: "pointer",
               color: tab === tb.key ? "#fff" : t.text,
-              fontFamily: "inherit", fontSize: ".6rem", fontWeight: 700 }}>
+              fontFamily: "inherit", fontSize: ".75rem", fontWeight: 700 }}>
             {tb.label}
           </button>
         ))}
@@ -742,8 +742,8 @@ const MathKeyboard = React.memo(function MathKeyboard({ theme: t, onKey }) {
               onMouseDown={e => { e.preventDefault(); onKey(btn.insert); }}
               style={{
                 background: t.kbBtnBg, border: `1px solid ${t.kbBtnBorder}`,
-                borderRadius: "6px", padding: ".36rem .08rem", cursor: "pointer",
-                color: t.text, fontFamily: "inherit", fontSize: ".68rem", fontWeight: 600,
+                borderRadius: "6px", padding: ".45rem .08rem", cursor: "pointer",
+                color: t.text, fontFamily: "inherit", fontSize: ".9rem", fontWeight: 600,
               }}
               onMouseEnter={e => { e.currentTarget.style.background = t.kbBtnHover; }}
               onMouseLeave={e => { e.currentTarget.style.background = t.kbBtnBg; }}
@@ -760,7 +760,7 @@ const MathKeyboard = React.memo(function MathKeyboard({ theme: t, onKey }) {
    ========================================================================= */
 
 const Graph = React.memo(function Graph({ exprData, center, evalX, numTerms, showDeriv, showInteg, showDeriv2,
-                  odeCurve, odeVisible, theme }) {
+                  taylorEnabled, odeCurve, odeVisible, theme }) {
   const canvasRef = useRef(null);
   const viewRef   = useRef({ cx: 0, cy: 0, scale: 80 });
   const dragRef   = useRef(null);
@@ -854,7 +854,7 @@ const Graph = React.memo(function Graph({ exprData, center, evalX, numTerms, sho
     exprData.forEach(ed => {
       if (!ed.visible) return;
       if (ed.realFn) plotFn(ed.realFn, ed.color, 2.5);
-      if (ed.showTaylor && ed.coeffs && ed.coeffs.length) {
+      if (ed.showTaylor && taylorEnabled && ed.coeffs && ed.coeffs.length) {
         const cc = ed.coeffs, cn = center;
         plotFn(x => evalPoly(cc, cn, x), ed.color + "80", 2, [8, 4]);
       }
@@ -1028,6 +1028,7 @@ function TaylorApp() {
   const [showSyntax,         setShowSyntax]         = useState(false);
   const [showKeyboard,       setShowKeyboard]       = useState(false);
   const [showTaylorSettings, setShowTaylorSettings] = useState(true);
+  const [taylorEnabled,      setTaylorEnabled]      = useState(true);
   const [themeMode,          setThemeMode]          = useState("dark");
   const [showDeriv,          setShowDeriv]          = useState(false);
   const [showDeriv2,         setShowDeriv2]         = useState(false);
@@ -1273,9 +1274,9 @@ function TaylorApp() {
         display: "flex", alignItems: "center", gap: "1rem", flexShrink: 0 }}>
         <div>
           <div style={{ fontSize: ".55rem", letterSpacing: ".3em", color: t.headerSub,
-            textTransform: "uppercase", fontWeight: 700 }}>Numerical Analysis</div>
+            textTransform: "uppercase", fontWeight: 700 }}>Calculus Calculator</div>
           <div style={{ fontSize: "1.1rem", fontWeight: 800, color: t.headerTitle, letterSpacing: ".04em" }}>
-            <span style={{ color: t.accent }}>Taylor</span> Polynomial Calculator
+            <span style={{ color: t.accent }}>Low Cortisol</span> Calculas
           </div>
         </div>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: ".8rem" }}>
@@ -1505,13 +1506,23 @@ function TaylorApp() {
 
               {/* Taylor Settings (collapsible) */}
               <div>
-                <div style={{ display: "flex", alignItems: "center", cursor: "pointer",
-                  userSelect: "none", padding: ".35rem 0" }}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+                  cursor: "pointer", userSelect: "none", padding: ".35rem 0" }}
                   onClick={() => setShowTaylorSettings(s => !s)}>
                   <div style={{ fontSize: ".7rem", fontWeight: 800, color: t.headerTitle,
                     letterSpacing: ".06em", textTransform: "uppercase" }}>
                     {showTaylorSettings ? "\u25bc" : "\u25b6"} Taylor Settings
                   </div>
+                  <button
+                    onClick={e => { e.stopPropagation(); setTaylorEnabled(s => !s); }}
+                    title={taylorEnabled ? "Disable Taylor approximation" : "Enable Taylor approximation"}
+                    style={{ background: taylorEnabled ? t.accent2 : t.panel,
+                      border: `1px solid ${taylorEnabled ? t.accent2 : t.border}`,
+                      borderRadius: "4px", padding: ".15rem .45rem", cursor: "pointer",
+                      fontSize: ".58rem", fontWeight: 700, color: taylorEnabled ? "#fff" : t.textMuted,
+                      fontFamily: "inherit" }}>
+                    {taylorEnabled ? "ON" : "OFF"}
+                  </button>
                 </div>
                 {showTaylorSettings && (
                   <div style={{ display: "flex", flexDirection: "column", gap: ".6rem", paddingTop: ".3rem" }}>
@@ -1733,6 +1744,7 @@ function TaylorApp() {
           <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
             <Graph exprData={exprData} center={center} evalX={evalX} numTerms={terms}
               showDeriv={showDeriv} showInteg={showInteg} showDeriv2={showDeriv2}
+              taylorEnabled={taylorEnabled}
               odeCurve={odeCurve} odeVisible={odeMode && odeVisible}
               theme={t} />
             <div style={{ position: "absolute", top: 8, right: 10, fontSize: ".58rem",
