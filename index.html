@@ -57,6 +57,7 @@ function computeCoeffs(compiled, a, numTerms, r = 0.5, N = 1024, extraScope = {}
     }
     coeffs[n] = re / (N * rPow);
     rPow *= r;
+    if (!isFinite(coeffs[n])) { coeffs[n] = 0; } // guard against underflow/overflow
   }
   return coeffs;
 }
@@ -143,16 +144,20 @@ function solveODE_RK4(fExpr, x0, y0, xMin, xMax, h = 0.01) {
 
 // Adaptive Simpson's rule for numerical integration
 function adaptiveSimpson(f, a, b, tol, maxDepth) {
+  if (!isFinite(a) || !isFinite(b)) return NaN;
   tol = tol || 1e-10;
-  maxDepth = maxDepth || 50;
+  maxDepth = maxDepth || 30;
   function simpson(a, b) {
     const c = (a + b) / 2;
-    return ((b - a) / 6) * (f(a) + 4 * f(c) + f(b));
+    const fa = f(a), fc = f(c), fb = f(b);
+    if (!isFinite(fa) || !isFinite(fc) || !isFinite(fb)) return NaN;
+    return ((b - a) / 6) * (fa + 4 * fc + fb);
   }
   function recurse(a, b, whole, depth) {
     const c = (a + b) / 2;
     const left = simpson(a, c);
     const right = simpson(c, b);
+    if (!isFinite(left) || !isFinite(right)) return (isFinite(left) ? left : 0) + (isFinite(right) ? right : 0);
     if (depth >= maxDepth || Math.abs(left + right - whole) <= 15 * tol) {
       return left + right + (left + right - whole) / 15;
     }
@@ -160,18 +165,22 @@ function adaptiveSimpson(f, a, b, tol, maxDepth) {
   }
   if (a === b) return 0;
   if (a > b) return -adaptiveSimpson(f, b, a, tol, maxDepth);
-  return recurse(a, b, simpson(a, b), 0);
+  const whole = simpson(a, b);
+  if (!isFinite(whole)) return NaN;
+  return recurse(a, b, whole, 0);
 }
 
 // Numerical limit via Richardson extrapolation
 function numericalLimit(f, target, side) {
   // side: 0=both, 1=right, -1=left
   side = side || 0;
+  if (!isFinite(target)) return NaN;
   function limitFromSide(dir) {
     const hs = [];
     const vals = [];
-    for (let k = 1; k <= 14; k++) {
-      const h = dir * Math.pow(0.1, k);
+    // Use moderate step sizes to avoid catastrophic cancellation
+    for (let k = 1; k <= 20; k++) {
+      const h = dir * Math.pow(0.5, k);
       try {
         const v = f(target + h);
         if (!isFinite(v)) continue;
@@ -180,18 +189,31 @@ function numericalLimit(f, target, side) {
       } catch(e) { continue; }
     }
     if (vals.length < 3) return NaN;
+    // Check direct convergence of raw values first (handles oscillatory functions)
+    const last3 = vals.slice(-3);
+    const spread = Math.max(...last3) - Math.min(...last3);
+    const directVal = vals[vals.length - 1];
     // Richardson extrapolation table
     let table = vals.slice();
+    let bestLen = table.length;
     for (let j = 1; j < table.length; j++) {
       const next = [];
       for (let i = 0; i < table.length - j; i++) {
         const r = hs[i] / hs[i + j];
-        next.push((r * table[i + 1] - table[i]) / (r - 1));
+        if (Math.abs(r - 1) < 1e-15) continue; // avoid division by zero
+        const val = (r * table[i + 1] - table[i]) / (r - 1);
+        if (isFinite(val)) next.push(val);
       }
+      if (next.length === 0) break;
       table = next;
-      if (table.length === 1) break;
+      if (table.length <= 1) break;
     }
-    return table[0];
+    const richVal = (table.length > 0 && isFinite(table[0])) ? table[0] : NaN;
+    // If Richardson diverged (result far from raw values), prefer direct convergence
+    if (isFinite(richVal) && spread < 0.1 * (1 + Math.abs(directVal))) {
+      if (Math.abs(richVal - directVal) > 10 * spread) return directVal;
+    }
+    return isFinite(richVal) ? richVal : (isFinite(directVal) ? directVal : NaN);
   }
   if (side > 0) return limitFromSide(1);
   if (side < 0) return limitFromSide(-1);
@@ -244,7 +266,9 @@ function solveEquation(exprText) {
         const mid = (lo + hi) / 2;
         const fm = f(mid);
         if (!isFinite(fm)) break;
-        if (f(lo) * fm < 0) hi = mid; else lo = mid;
+        const flo = f(lo);
+        if (!isFinite(flo)) break;
+        if (flo * fm < 0) hi = mid; else lo = mid;
       }
       const root = (lo + hi) / 2;
       const key = root.toFixed(8);
@@ -263,6 +287,7 @@ function solveEquation(exprText) {
       const dfx = df(x);
       if (!isFinite(fx) || !isFinite(dfx) || Math.abs(dfx) < 1e-15) break;
       const xNew = x - fx / dfx;
+      if (!isFinite(xNew)) break;
       if (Math.abs(xNew - x) < 1e-12) { x = xNew; break; }
       x = xNew;
     }
@@ -312,6 +337,7 @@ function preprocessCalculus(text) {
       const vName = m[2];
       const a = math.evaluate(m[3]);
       const b = math.evaluate(m[4]);
+      if (!isFinite(a) || !isFinite(b)) return { type: "error", result: "Invalid bounds: must be finite numbers" };
       const f = t => { try { const v = compiled.evaluate({ [vName]: t }); return typeof v === "number" ? v : NaN; } catch(e) { return NaN; } };
       const result = adaptiveSimpson(f, a, b);
       return { type: "numeric", label: `∫[${m[3]},${m[4]}]`, result };
@@ -744,7 +770,9 @@ const Graph = React.memo(function Graph({ exprData, center, evalX, numTerms, sho
     const cv = canvasRef.current;
     if (!cv) return;
     const ctx = cv.getContext("2d");
+    if (!ctx) return;
     const W = cv.width, H = cv.height;
+    if (W === 0 || H === 0) return;
     const { cx, cy, scale: S } = viewRef.current;
 
     const sx = wx => (wx - cx) * S + W / 2;
@@ -920,9 +948,11 @@ const Graph = React.memo(function Graph({ exprData, center, evalX, numTerms, sho
   const onWheel = useCallback(e => {
     e.preventDefault();
     const cv = canvasRef.current;
+    if (!cv) return;
     const rect = cv.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const { cx, cy, scale } = viewRef.current;
+    if (!scale || scale <= 0) return;
     const W = cv.width, H = cv.height;
     const f = e.deltaY < 0 ? 1.2 : 0.833;
     const wMx = (mx - W/2) / scale + cx;
@@ -1044,11 +1074,14 @@ function TaylorApp() {
         if (focusedId) {
           updateExpr(focusedId, { text: result.processed });
         } else {
+          // Add new expression and insert OCR text safely
+          const newId = nextExpressionId; // peek at next ID before addExpression increments it
           addExpression();
           setTimeout(() => {
             setExpressions(prev => {
-              const last = prev[prev.length - 1];
-              return prev.map(e => e.id === last.id ? { ...e, text: result.processed } : e);
+              const target = prev.find(e => e.id === newId) || prev[prev.length - 1];
+              if (!target) return prev;
+              return prev.map(e => e.id === target.id ? { ...e, text: result.processed } : e);
             });
           }, 50);
         }
@@ -1096,14 +1129,15 @@ function TaylorApp() {
       if (start > 0) {
         const newText = txt.slice(0, start - 1) + txt.slice(end);
         updateExpr(focusedId, { text: newText });
-        setTimeout(() => { el.focus(); el.setSelectionRange(start - 1, start - 1); }, 0);
+        const pos = start - 1;
+        setTimeout(() => { if (el && el.parentNode) { try { el.focus(); el.setSelectionRange(pos, pos); } catch(e) {} } }, 0);
       }
       return;
     }
     const newText = txt.slice(0, start) + insert + txt.slice(end);
     updateExpr(focusedId, { text: newText });
     const newPos = start + insert.length;
-    setTimeout(() => { el.focus(); el.setSelectionRange(newPos, newPos); }, 0);
+    setTimeout(() => { if (el && el.parentNode) { try { el.focus(); el.setSelectionRange(newPos, newPos); } catch(e) {} } }, 0);
   };
 
   // Compile all expressions (with calculus engine + slider variables)
